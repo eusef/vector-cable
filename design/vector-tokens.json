@@ -1,0 +1,132 @@
+{
+  "name": "Vector",
+  "version": 2,
+  "meta": {
+    "source": "github",
+    "repo": "eusef/vector-comm",
+    "paths": {
+      "tokens": ["VectorComm/App/Theme.swift", "DOC/UI-IMPLEMENTATION-SPEC.md"],
+      "status": ["VectorComm/Views/MapView.swift"],
+      "waterfall": ["VectorComm/Decode/WaterfallFFT.swift"],
+      "docs": ["DOC/UI-IMPLEMENTATION-SPEC.md", "DOC/screenshots/"]
+    },
+    "synced": "2026-09-23"
+  },
+  "color": {
+    "themes": [
+      {"id": "standard", "name": "Standard"},
+      {"id": "night-ops", "name": "Night Ops"}
+    ],
+    "tokens": [
+      {"name": "background", "value": {"standard": "#0e1210", "night-ops": "#0d0a0a"}, "usage": "Screen background behind panels. Night Ops shifts it toward red to protect dark adaptation."},
+      {"name": "panel-fill", "value": {"standard": "#1a1f1c", "night-ops": "#1a1414"}, "usage": "Fill of every panel, card and the app header. The default reading ground for all text tokens."},
+      {"name": "panel-border", "value": {"standard": "#2a312c", "night-ops": "#4a1412"}, "usage": "1px border on panels, chips, fields and dividers. Decorative only: 1.25:1 on panel-fill (Standard), so never the only thing that marks a control."},
+      {"name": "accent", "value": {"standard": "#3fbf4f", "night-ops": "#e0332e"}, "usage": "The one accent: active state, primary CTA, selected tab, slot ring, focused chip. Text in accent on panel-fill: 6.98:1 Standard; 4.06:1 Night Ops (passes only at 19px bold or 24px+)."},
+      {"name": "tx", "value": "#e0332e", "usage": "Transmit and emergency only: TX marker, TX n/m indicator, unread badge, Emergency and Medical icons, Absent count. Fills and marks; for small text use tx-text (3.73:1 on panel-fill, Standard)."},
+      {"name": "warning", "value": "#f5c518", "usage": "Amber: unknown or degraded state, stations heard in the last 24 h, Pending count. 10.25:1 on panel-fill."},
+      {"name": "selected", "value": "#2e6be6", "usage": "Selected station and own station (map marker, selected row fill, graph hub). Fills and strokes only; 3.47:1 as text on panel-fill."},
+      {"name": "text-primary", "value": "#ffffff", "usage": "Titles, table values, button labels on panel-fill, background and field-fill. 16.7:1 on panel-fill."},
+      {"name": "text-secondary", "value": "#9e9e9e", "usage": "Column headers, units, timestamps, captions, empty-state copy on panel-fill and background. 6.24:1 on panel-fill."},
+      {"name": "rx", "value": "#3fbf4f", "usage": "RX waterfall marker and the Online dot. Stays green in Night Ops so RX and TX markers remain distinguishable on a red screen (R21)."},
+      {"name": "tx-fill", "value": "#d02e29", "usage": "Added 2026-09-29. Red fill that carries white text: Stop button, TX pill, unread badge, waterfall TX tag. White on tx-fill is 5.12:1; white on tx is 4.48:1 and fails 1.4.3 below 19px bold. Reads as the same on-air red."},
+      {"name": "tx-text", "value": "#f25a54", "usage": "Intentional addition. Small red text on panel-fill (error hints such as 'Connect the USB-C audio adapter'). 5.07:1 Standard, 5.52:1 Night Ops."},
+      {"name": "on-accent", "value": {"standard": "#0e1210", "night-ops": "#ffffff"}, "usage": "Intentional addition. Text on a solid accent fill (sent bubble, filled Setup row). 6.1:1 Standard, 5.65:1 Night Ops. The source uses white, which is 3.09:1 on the Standard sent bubble."},
+      {"name": "field-fill", "value": {"standard": "rgba(14, 18, 16, 0.6)", "night-ops": "rgba(13, 10, 10, 0.6)"}, "usage": "Inactive chips, station chip, text fields: background at 60% over panel-fill."},
+      {"name": "tile-fill", "value": "rgba(255, 255, 255, 0.06)", "usage": "Small pills and tiles inside a card (condition pills, index chips): white at 6% over panel-fill."},
+      {"name": "accent-soft", "value": {"standard": "rgba(63, 191, 79, 0.15)", "night-ops": "rgba(224, 51, 46, 0.15)"}, "usage": "Selected tab fill under an accent outline."},
+      {"name": "accent-chip", "value": {"standard": "rgba(63, 191, 79, 0.18)", "night-ops": "rgba(224, 51, 46, 0.18)"}, "usage": "Active chip fill; label and 1px border are accent."},
+      {"name": "row-selected", "value": {"standard": "rgba(63, 191, 79, 0.25)", "night-ops": "rgba(224, 51, 46, 0.25)"}, "usage": "Selected table row and selected template list row."},
+      {"name": "row-directed", "value": {"standard": "rgba(63, 191, 79, 0.12)", "night-ops": "rgba(224, 51, 46, 0.12)"}, "usage": "Table rows directed to my callsign."},
+      {"name": "bubble-sent", "value": {"standard": "rgba(63, 191, 79, 0.85)", "night-ops": "rgba(224, 51, 46, 0.85)"}, "usage": "Outgoing message bubble fill; text in on-accent. Incoming bubbles use background."},
+      {"name": "status-recent", "value": "{rx}", "usage": "Station dot: heard in the last 15 min. Fixed green in both themes (R15)."},
+      {"name": "status-today", "value": "{warning}", "usage": "Station dot: heard in the last 24 h."},
+      {"name": "status-stale", "value": "#808080", "usage": "Station dot: heard more than 24 h ago. 4.23:1 on panel-fill."},
+      {"name": "status-indirect", "value": "#8c8c8c", "usage": "Station known only through a relay or HEARING report; drawn with a dashed ring or dashed pill border."},
+      {"name": "status-selected", "value": "{selected}", "usage": "Station dot and marker for the selected station and for me."},
+      {"name": "status-ok", "value": "{rx}", "usage": "Added 2026-09-28. Good or ready state of a check, service or tile (icon, border, status word, meter fill). Fixed green in every theme, like rx, so Ready never turns on-air red in Night Ops. 6.98:1 on panel-fill (Standard), 7.6:1 on Night Ops panel-fill. Replaces accent for 'good'."},
+      {"name": "status-locked", "value": "{text-secondary}", "usage": "Added 2026-09-28. Locked or not yet enabled (Transmit locked until the antenna is confirmed). Neutral on purpose: locked is a safe, expected state, not a warning. Always paired with a lock icon and the word Locked."},
+      {"name": "grey-line", "value": "#d1d1d1", "usage": "Solar terminator line and its legend swatch on the globe."},
+      {"name": "heat-0", "value": "#000040", "usage": "Waterfall Heat palette, noise floor (x = 0)."},
+      {"name": "heat-1", "value": "#00008c", "usage": "Waterfall Heat palette, x = 0.25."},
+      {"name": "heat-2", "value": "#0066d9", "usage": "Waterfall Heat palette, x = 0.5."},
+      {"name": "heat-3", "value": "#80ccc6", "usage": "Waterfall Heat palette, x = 0.75."},
+      {"name": "heat-4", "value": "#ffff66", "usage": "Waterfall Heat palette, peak signal (x = 1)."},
+      {"name": "mono-red-peak", "value": "#ff2828", "usage": "Waterfall Red mono palette peak; black at the floor. Chosen automatically with Night Ops."},
+      {"name": "mono-green-peak", "value": "#c8ff78", "usage": "Waterfall Green and Digital rain palette peak; black at the floor."}
+    ]
+  },
+  "type": {
+    "fonts": [],
+    "families": {
+      "sans": "-apple-system, BlinkMacSystemFont, \"SF Pro Text\", system-ui, \"Segoe UI\", \"Helvetica Neue\", Arial, sans-serif",
+      "mono": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, Consolas, \"Liberation Mono\", monospace"
+    },
+    "groups": [
+      {"name": "Display", "family": "sans", "styles": [
+        {"name": "large-title", "fontSize": "34px", "lineHeight": "41px", "fontWeight": 400, "usage": "Empty-state glyph size; rarely text.", "sample": "No decodes yet"},
+        {"name": "verdict", "fontSize": "34px", "lineHeight": "41px", "fontWeight": 700, "usage": "Added 2026-09-28. The one-word answer on a readiness card (Ready, Locked, Transmitting). One per card, always beside its status icon.", "sample": "Ready"},
+        {"name": "screen-title", "fontSize": "28px", "lineHeight": "34px", "fontWeight": 700, "usage": "Added 2026-09-28. Title of a detail page or the object a page is about (Elecraft KX2).", "sample": "Elecraft KX2"},
+        {"name": "readout", "fontSize": "22px", "lineHeight": "28px", "fontWeight": 700, "usage": "Big numbers and times: Next Net time, Checked In counts.", "sample": "Tue 01:00Z"},
+        {"name": "wordmark", "fontSize": "20px", "lineHeight": "25px", "fontWeight": 700, "usage": "App name in the header; conversation callsign.", "sample": "VectorComm"}
+      ]},
+      {"name": "Panel", "family": "sans", "styles": [
+        {"name": "panel-title", "fontSize": "17px", "lineHeight": "22px", "fontWeight": 600, "usage": "Every panel title (Band Activity, Waterfall, Net Control).", "sample": "Band Activity"},
+        {"name": "body", "fontSize": "17px", "lineHeight": "22px", "fontWeight": 400, "usage": "Body copy, settings rows, empty-state sentences.", "sample": "Tap a station in Band Activity to start a conversation."},
+        {"name": "subheadline", "fontSize": "15px", "lineHeight": "20px", "fontWeight": 400, "usage": "Secondary lines, subtitles, battery percent.", "sample": "0 stations (last 30 min)"},
+        {"name": "subheadline-strong", "fontSize": "15px", "lineHeight": "20px", "fontWeight": 600, "usage": "Chip labels (500), station chip callsign, slot seconds.", "sample": "W1AW"}
+      ]},
+      {"name": "Small", "family": "sans", "styles": [
+        {"name": "footnote", "fontSize": "13px", "lineHeight": "18px", "fontWeight": 400, "usage": "Help text under settings, tip cards.", "sample": "Night Ops picks Red mono automatically."},
+        {"name": "caption", "fontSize": "12px", "lineHeight": "16px", "fontWeight": 400, "usage": "Column headers, units, bubble meta, pill labels.", "sample": "Last Heard"},
+        {"name": "caption-strong", "fontSize": "12px", "lineHeight": "16px", "fontWeight": 600, "usage": "Pill values, audio route name, section labels.", "sample": "30/20m Fair"},
+        {"name": "caption2", "fontSize": "11px", "lineHeight": "13px", "fontWeight": 400, "usage": "Tab labels, badge counts.", "sample": "Operate"},
+        {"name": "micro", "fontSize": "8px", "lineHeight": "10px", "fontWeight": 400, "usage": "Only the 'Next Slot' label inside the slot ring.", "sample": "Next Slot"}
+      ]},
+      {"name": "Data", "family": "mono", "styles": [
+        {"name": "data", "fontSize": "13px", "lineHeight": "18px", "fontWeight": 400, "usage": "Table cells: UTC, offset, SNR, dt, callsign, grid. Digits must align.", "sample": "01:43  1179  -8  0.1  W7ABC"},
+        {"name": "message", "fontSize": "17px", "lineHeight": "22px", "fontWeight": 400, "usage": "Message text in bubbles and the compose field: exactly what goes on air.", "sample": "W1AW STATUS?"},
+        {"name": "marker", "fontSize": "12px", "lineHeight": "16px", "fontWeight": 600, "usage": "Map station pills and waterfall marker labels.", "sample": "W7ABC  DM13"}
+      ]}
+    ]
+  },
+  "spacing": {"tokens": [
+    {"name": "space-2", "value": "2px", "usage": "Tab icon to label; title to subtitle."},
+    {"name": "space-4", "value": "4px", "usage": "Tab strip gap; icon to value in the battery chip."},
+    {"name": "space-6", "value": "6px", "usage": "Dot to label inside pills; bubble meta items."},
+    {"name": "space-8", "value": "8px", "usage": "Default gap between siblings; pill padding; field padding."},
+    {"name": "space-10", "value": "10px", "usage": "Bubble padding; station chip and band pill horizontal padding."},
+    {"name": "space-12", "value": "12px", "usage": "Panel horizontal padding; chip horizontal padding; gap between panels and header items."},
+    {"name": "space-14", "value": "14px", "usage": "Setup card and Radio Weather card inner padding."},
+    {"name": "space-16", "value": "16px", "usage": "Empty-state stack gap; large section gap."},
+    {"name": "space-20", "value": "20px", "usage": "Empty-state outer padding."}
+  ]},
+  "radius": {"tokens": [
+    {"name": "radius-xs", "value": "3px", "usage": "Waterfall marker labels, meter bars."},
+    {"name": "radius-sm", "value": "4px", "usage": "TX bandwidth band on the waterfall."},
+    {"name": "radius-md", "value": "6px", "usage": "Map legend and scale bar plates."},
+    {"name": "radius-field", "value": "8px", "usage": "Chips, fields, tabs, list rows, station chip, small cards."},
+    {"name": "radius-panel", "value": "12px", "usage": "Panels, header, message bubbles."},
+    {"name": "radius-pill", "value": "999px", "usage": "Condition pills, map station pills, badges, status dots."}
+  ]},
+  "size": {"tokens": [
+    {"name": "tap-target", "value": "44px", "usage": "Minimum height and width of every tappable control on every platform."},
+    {"name": "header-height", "value": "64px", "usage": "App header row."},
+    {"name": "tab-width", "value": "84px", "usage": "One tab in the header tab strip."},
+    {"name": "tab-height", "value": "48px", "usage": "One tab in the header tab strip."},
+    {"name": "slot-ring", "value": "52px", "usage": "Next Slot ring diameter."},
+    {"name": "pill-height", "value": "28px", "usage": "Condition and index pills."},
+    {"name": "dot", "value": "8px", "usage": "Status dots in lists, chips and legends."},
+    {"name": "meter-height", "value": "8px", "usage": "Added 2026-09-28. Height of a LevelMeter track (receive level with its target range)."},
+    {"name": "button-height", "value": "48px", "usage": "Added 2026-09-28. Primary Button in a card or sheet: one step above tap-target so the one main action is easy to hit with gloves."}
+  ]},
+  "stroke": {"tokens": [
+    {"name": "stroke-hairline", "value": "1px", "usage": "Panel, chip and field borders; dividers; dashed frequency markers."},
+    {"name": "stroke-emphasis", "value": "2px", "usage": "Own or focused map pill; selected graph node."},
+    {"name": "stroke-ring", "value": "3px", "usage": "Slot ring track and progress."}
+  ]},
+  "opacity": {"tokens": [
+    {"name": "opacity-pressed", "value": "0.7", "usage": "Chip and button while pressed."},
+    {"name": "opacity-partial", "value": "0.6", "usage": "A message still being received."},
+    {"name": "opacity-disabled", "value": "0.5", "usage": "Disabled tab labels (on text-secondary)."}
+  ]}
+}

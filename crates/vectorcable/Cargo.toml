@@ -1,0 +1,21 @@
+[package]
+name = "vectorcable"
+description = "VectorCable: virtual audio cables and terminal UI for a VectorBridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[dependencies]
+vbcore = { path = "../vbcore" }
+serde_json = { workspace = true }
+ratatui = "0.30"
+crossterm = "0.29"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+serde_json = { workspace = true }

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=VectorCable
+GenericName=Radio audio cable
+Comment=Audio cable and rig control relay between digital-mode apps and a VectorBridge
+Exec=vectorcable
+Terminal=true
+Icon=audio-card
+Categories=AudioVideo;Audio;HamRadio;
+Keywords=WSJT-X;JS8Call;FLDIGI;FT8;Hamlib;radio;

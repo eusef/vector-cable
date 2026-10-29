@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/vbcore", "crates/vectorcable"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "GPL-3.0-only"
+rust-version = "1.85"
+repository = "https://github.com/eusef/vector-cable"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,8 @@
+.DS_Store
+target/
+.env*
+*.pem
+*.p8
+*.p12
+*.key
+*.mobileprovision

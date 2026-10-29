@@ -1,0 +1,7 @@
+# Phil's pick (2026-10-28). block-buffer 0.10.4 is in Cargo.lock only through
+# ratatui's optional `termwiz` feature, which this workspace does not enable:
+# `cargo tree -i block-buffer --workspace -e all --target all` prints nothing.
+# The fix (0.12.1) needs sha2 0.11 upstream; `cargo update` cannot reach it.
+[[IgnoredVulns]]
+id = "GHSA-qwgh-2vcv-g2f7"
+reason = "Not compiled: block-buffer 0.10.4 is reachable only via ratatui's optional termwiz feature, which is not enabled"
