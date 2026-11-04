@@ -1413,6 +1413,7 @@ mod tests {
             status: Some(BridgeStatus::default()),
             ladder: None,
             rigctl: None,
+            relay_rigctl: None,
             version: None,
             rx: RxStats::default(),
             playback: PlaybackStats::default(),

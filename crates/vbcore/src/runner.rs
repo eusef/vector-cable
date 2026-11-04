@@ -241,6 +241,10 @@ pub struct Snapshot {
     pub status: Option<BridgeStatus>,
     pub ladder: Option<LadderState>,
     pub rigctl: Option<RigctlState>,
+    /// The proxy port and `vb_auth` of the last 200 `/api/rigctl` at this
+    /// address, kept through failed polls (a 503 or a move clears it): the relay
+    /// goes by this, so a Wi-Fi stall does not send apps up with no log-in.
+    pub relay_rigctl: Option<(u16, bool)>,
     pub version: Option<BridgeVersion>,
     pub rx: RxStats,
     pub playback: PlaybackStats,
@@ -277,6 +281,7 @@ impl Snapshot {
             status: None,
             ladder: None,
             rigctl: None,
+            relay_rigctl: None,
             version: None,
             rx: RxStats::default(),
             playback: PlaybackStats::default(),
@@ -499,12 +504,27 @@ fn point_at(
     s.bridge = bridge;
     s.local_ip = local_ip;
     s.rigctl = None;
+    s.relay_rigctl = None;
+}
+
+/// A polled `/api/rigctl`, for the UI as it came and for the relay as
+/// `relay_rigctl`.
+fn store_rigctl(s: &mut Snapshot, rigctl: RigctlState, rig_port: u16) {
+    match &rigctl {
+        RigctlState::Proxy { port, vb_auth, .. } => {
+            s.relay_rigctl = Some((port.unwrap_or(rig_port), *vb_auth));
+        }
+        RigctlState::NoProxy => s.relay_rigctl = None,
+        RigctlState::Unavailable { .. } => {}
+    }
+    s.rigctl = Some(rigctl);
 }
 
 /// Where the relay takes each app: the bridge's current address and rigctl proxy
 /// port, and the app token only when `/api/rigctl` says the proxy takes
 /// `\vb_auth` (an older one runs the line as rig commands) and the token is a 1.8
 /// app token, issued with a `device_id` (a session token is refused on 4532).
+/// Goes by `Snapshot::relay_rigctl`, which a failed poll does not clear.
 fn relay_source(
     rig_port: u16,
     snapshot: Arc<Mutex<Snapshot>>,
@@ -513,13 +533,8 @@ fn relay_source(
     Arc::new(move || {
         let (ip, port, vb_auth) = {
             let snap = snapshot.lock().unwrap();
-            let ip = snap.bridge.ip();
-            match &snap.rigctl {
-                Some(RigctlState::Proxy { port, vb_auth, .. }) => {
-                    (ip, port.unwrap_or(rig_port), *vb_auth)
-                }
-                _ => (ip, rig_port, false),
-            }
+            let (port, vb_auth) = snap.relay_rigctl.unwrap_or((rig_port, false));
+            (snap.bridge.ip(), port, vb_auth)
         };
         let token = if vb_auth {
             let a = auth.lock().unwrap();
@@ -771,7 +786,7 @@ impl Worker {
                         http_in_flight = false;
                         let mut s = self.snapshot.lock().unwrap();
                         s.ladder = Some(ladder);
-                        s.rigctl = Some(rigctl);
+                        store_rigctl(&mut s, rigctl, self.config.rig_port);
                         if version.is_some() {
                             s.version = version;
                         }
@@ -1130,7 +1145,7 @@ mod tests {
             Mode::ListenOnly,
             String::new(),
         )));
-        snapshot.lock().unwrap().rigctl = Some(proxy_with_vb_auth());
+        store_rigctl(&mut snapshot.lock().unwrap(), proxy_with_vb_auth(), 4532);
         let auth = Arc::new(Mutex::new(Auth {
             token: Some("oldbridgetoken".into()),
             device_id: Some("fedcba9876543210".into()),
@@ -1147,11 +1162,51 @@ mod tests {
         assert_eq!((after.token, after.vb_auth), (None, false));
         // A fresh `/api/rigctl` at the new address names `\vb_auth`; still no
         // token until a POST there reads its `device_id`.
-        snapshot.lock().unwrap().rigctl = Some(proxy_with_vb_auth());
+        store_rigctl(&mut snapshot.lock().unwrap(), proxy_with_vb_auth(), 4532);
         let polled = source();
         assert_eq!((polled.token, polled.vb_auth), (None, true));
         assert_eq!(snapshot.lock().unwrap().bridge, new);
         assert_eq!(auth.lock().unwrap().moves, 1);
+    }
+
+    #[test]
+    fn a_failed_rigctl_poll_keeps_the_relay_logging_in() {
+        let bridge: SocketAddr = "192.0.2.1:4730".parse().unwrap();
+        let snapshot = Arc::new(Mutex::new(Snapshot::new(
+            bridge,
+            0,
+            Mode::ListenOnly,
+            String::new(),
+        )));
+        store_rigctl(&mut snapshot.lock().unwrap(), proxy_with_vb_auth(), 4532);
+        let auth = Arc::new(Mutex::new(Auth {
+            token: Some("apptoken".into()),
+            device_id: Some("fedcba9876543210".into()),
+            moves: 0,
+        }));
+        let source = relay_source(4532, snapshot.clone(), auth.clone());
+        let stall = || RigctlState::Unavailable {
+            status: None,
+            detail: "timed out".into(),
+        };
+        // The poll fails before any app connects: the first app still logs in.
+        store_rigctl(&mut snapshot.lock().unwrap(), stall(), 4532);
+        let stalled = source();
+        assert_eq!(
+            (stalled.token.as_deref(), stalled.vb_auth),
+            (Some("apptoken"), true)
+        );
+        // A 503 is the bridge's answer, not a failed poll: no proxy, no log-in,
+        // and a later failed poll does not bring the old proxy back.
+        store_rigctl(&mut snapshot.lock().unwrap(), RigctlState::NoProxy, 4532);
+        store_rigctl(&mut snapshot.lock().unwrap(), stall(), 4532);
+        let off = source();
+        assert_eq!((off.token, off.vb_auth), (None, false));
+        // Nor does a failed poll at a new address carry the old one's proxy.
+        store_rigctl(&mut snapshot.lock().unwrap(), proxy_with_vb_auth(), 4532);
+        point_at(&snapshot, &auth, "192.0.2.2:4730".parse().unwrap(), None);
+        store_rigctl(&mut snapshot.lock().unwrap(), stall(), 4532);
+        assert!(!source().vb_auth);
     }
 
     fn looked_up(_: &str) -> std::io::Result<Vec<IpAddr>> {

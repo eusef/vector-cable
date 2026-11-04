@@ -746,6 +746,7 @@ mod tests {
             }),
             ladder: None,
             rigctl: None,
+            relay_rigctl: None,
             version: None,
             rx: Default::default(),
             playback: Default::default(),

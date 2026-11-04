@@ -94,6 +94,7 @@ fn snapshot_of(
         status,
         ladder: Some(ladder),
         rigctl: Some(rigctl),
+        relay_rigctl: None,
         version,
         rx: Default::default(),
         playback: Default::default(),

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 (2026-11-04, beta)
+
+- Rig control relay: a single failed check of the bridge's rig control settings (a short Wi-Fi
+  dropout, for example) no longer makes the relay skip its log-in, so WSJT-X, JS8Call and FLDIGI
+  keep rig control instead of being refused until the next good check.
+
 ## 0.2.0 (2026-10-29, beta)
 
 Adds Linux. macOS stays Apple silicon, unsigned.
