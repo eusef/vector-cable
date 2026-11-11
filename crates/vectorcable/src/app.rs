@@ -16,7 +16,7 @@ use vbcore::discovery::{self, Found};
 use vbcore::pin::TokenStore;
 use vbcore::playback::DEFAULT_TARGET_LATENCY_S;
 use vbcore::protocol::CONTROL_PORT;
-use vbcore::runner::{Command, CommandReply, Config, Runner, Snapshot};
+use vbcore::runner::{Command, CommandReply, Config, PinFor, Runner, Snapshot};
 use vbcore::session::Mode;
 
 use crate::cli::Args;
@@ -221,14 +221,21 @@ pub fn first_run_screen(_: &Args, _: bool) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Where bridge app tokens are kept: the Keychain on macOS; elsewhere, for
-/// now, only in memory.
+/// Where bridge app tokens are kept: the Keychain on macOS, an owner-only file
+/// on Linux; elsewhere, or with no home folder, only in memory, so the PIN is
+/// asked for on each run.
 #[cfg(target_os = "macos")]
 fn token_store() -> Option<Arc<dyn TokenStore>> {
     Some(Arc::new(crate::keychain::Keychain::new()))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn token_store() -> Option<Arc<dyn TokenStore>> {
+    let path = crate::tokenfile::path()?;
+    Some(Arc::new(crate::tokenfile::TokenFile::new(path)))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn token_store() -> Option<Arc<dyn TokenStore>> {
     None
 }
@@ -283,6 +290,8 @@ pub fn run_plain(args: &Args) -> Result<(), String> {
     let clock_rx = spawn_clock_listener();
     let mut last_summary = Instant::now();
     let mut last_snapshot = None;
+    // Apps retry CAT every few seconds; the hint is printed once per run.
+    let mut pin_hint_shown = false;
     loop {
         if QUIT.load(Ordering::SeqCst) {
             break;
@@ -300,6 +309,18 @@ pub fn run_plain(args: &Args) -> Result<(), String> {
                 }
                 CommandReply::ModeSet(m) => {
                     let _ = writeln!(out, "{} Mode set: {}.", utc_clock(), m.word());
+                }
+                CommandReply::PinWanted(_) if pin_hint_shown => {}
+                CommandReply::PinWanted(why) => {
+                    pin_hint_shown = true;
+                    let _ = writeln!(
+                        out,
+                        "{} The bridge PIN is needed {}; --plain cannot take it: run \
+                         vectorcable without --plain and press p. {}",
+                        utc_clock(),
+                        pin_reason(why),
+                        ui::pin_hint(&started.runner.snapshot(), bridge_name(&started.found))
+                    );
                 }
             }
         }
@@ -381,6 +402,18 @@ fn change_lines(was: Option<&Snapshot>, now: &Snapshot) -> Vec<String> {
     if was.map(ui::verdict_sentence).as_deref() != Some(sentence.as_str()) {
         out.push(sentence);
     }
+    let pin = ui::pin_status(now);
+    if let Some(p) = pin
+        .as_ref()
+        .filter(|_| was.map(ui::pin_status) != Some(pin.clone()))
+    {
+        out.push(format!(
+            "Bridge PIN {} {}: {}.",
+            p.glyph.text(false),
+            p.word,
+            p.label
+        ));
+    }
     out
 }
 
@@ -397,9 +430,71 @@ struct Ui {
     help: bool,
     /// The bridge PIN being typed (`p`), digits only.
     pin_entry: Option<String>,
+    /// Why the PIN is asked for (`ask_for_pin`): the band shows it, but keys
+    /// keep their jobs until `p` starts the entry.
+    pin_reason: Option<String>,
+    /// When the user last pressed Esc on the PIN entry.
+    pin_declined: Option<Instant>,
     status_lines: Vec<String>,
     bell_due: bool,
     quit: bool,
+}
+
+/// The name the bridge was found by, for the PIN hint; `None` when it was
+/// found by address, so the hint uses the bridge's current address.
+fn bridge_name(found: &Found) -> Option<&str> {
+    Some(found.host.trim()).filter(|h| !h.is_empty() && h.parse::<std::net::IpAddr>().is_err())
+}
+
+/// After Esc, a PIN asked for by an app (not by a key) waits this long
+/// before it is asked for again.
+const PIN_ASK_AGAIN: Duration = Duration::from_secs(60);
+
+/// Words after "The bridge PIN is needed".
+fn pin_reason(why: PinFor) -> &'static str {
+    match why {
+        PinFor::Setting => "to change the levels",
+        PinFor::RigControl => "for rig control (CAT and PTT)",
+    }
+}
+
+/// Asks for the PIN because something needs it: the band says why and where
+/// the PIN is set, and `p` starts typing it. The band takes no other key, so
+/// tabs (1 to 4) and Listen Only keep working. `by_key` is a key the user just
+/// pressed; an app's retries do not ask again within a minute of Esc.
+fn ask_for_pin(ui: &mut Ui, reason: &str, by_key: bool) {
+    if ui.pin_entry.is_some() || ui.pin_reason.is_some() {
+        return;
+    }
+    let declined = ui
+        .pin_declined
+        .is_some_and(|at| at.elapsed() < PIN_ASK_AGAIN);
+    if declined && !by_key {
+        return;
+    }
+    ui.pin_reason = Some(reason.to_string());
+    ui.status_lines.push(format!(
+        "The bridge PIN is needed {reason}: press p to type it."
+    ));
+}
+
+/// The bridge stopped taking VectorCable's login (the PIN changed, or the
+/// token was revoked): ask for the PIN again. A first `PinNeeded` at start-up
+/// is shown on the Status tab, not asked for. Once logged in, an ask that is
+/// still showing goes away.
+fn note_pin_lost(ui: &mut Ui, was: Option<&Snapshot>, now: &Snapshot) {
+    use vbcore::runner::ListingState as L;
+    let logged_in = |s: &Snapshot| matches!(s.listing, Some(L::Listed | L::Stored));
+    if logged_in(now) && ui.pin_entry.is_none() {
+        ui.pin_reason = None;
+    }
+    if was.is_some_and(logged_in) && now.listing.as_ref().is_some_and(|l| l.wants_pin()) {
+        ask_for_pin(
+            ui,
+            "again: the bridge no longer takes VectorCable's login",
+            false,
+        );
+    }
 }
 
 /// What a key does. Pure, so the rules are testable. `q` and Ctrl-C quit
@@ -426,6 +521,7 @@ fn handle_key(ui: &mut Ui, s: &Snapshot, code: KeyCode, modifiers: KeyModifiers)
             KeyCode::Enter if vbcore::pin::valid_pin(entry) => {
                 cmds.push(Command::SetPin(entry.clone()));
                 ui.pin_entry = None;
+                ui.pin_reason = None;
                 ui.status_lines
                     .push("Bridge PIN sent; logging in to list VectorCable.".into());
             }
@@ -434,6 +530,8 @@ fn handle_key(ui: &mut Ui, s: &Snapshot, code: KeyCode, modifiers: KeyModifiers)
                 .push("The bridge PIN is 4 to 8 digits.".into()),
             KeyCode::Esc => {
                 ui.pin_entry = None;
+                ui.pin_reason = None;
+                ui.pin_declined = Some(Instant::now());
                 ui.status_lines.push("Bridge PIN cancelled.".into());
             }
             _ => {}
@@ -465,6 +563,8 @@ fn handle_key(ui: &mut Ui, s: &Snapshot, code: KeyCode, modifiers: KeyModifiers)
         KeyCode::BackTab => ui.tab = ui.tab.previous(),
         KeyCode::Char('t') => cmds.push(Command::SetMode(Mode::Transmit)),
         KeyCode::Char('l') => cmds.push(Command::SetMode(Mode::ListenOnly)),
+        // The radio monitor: RX audio also on the default output. Off at every launch.
+        KeyCode::Char('m') => cmds.push(Command::SetMonitor(s.monitor.is_none())),
         KeyCode::Char('n') => {
             ui.theme.name = ui.theme.name.toggled();
             // The rest of the file (the relay port) is kept.
@@ -475,13 +575,29 @@ fn handle_key(ui: &mut Ui, s: &Snapshot, code: KeyCode, modifiers: KeyModifiers)
                 .push(format!("Theme {}.", ui.theme.name.word()));
         }
         KeyCode::Char('?') => ui.help = !ui.help,
+        // Keeps `pin_reason`, so the entry still says why.
         KeyCode::Char('p') => ui.pin_entry = Some(String::new()),
+        KeyCode::Esc if ui.pin_reason.is_some() => {
+            ui.pin_reason = None;
+            ui.pin_declined = Some(Instant::now());
+            ui.status_lines
+                .push("Bridge PIN not entered; press p when you want to.".into());
+        }
         KeyCode::Char('w') if ui.tab == Tab::Setup => ui.app = App::WsjtX,
         KeyCode::Char('j') if ui.tab == Tab::Setup => ui.app = App::Js8Call,
         KeyCode::Char('f') if ui.tab == Tab::Setup => ui.app = App::Fldigi,
         KeyCode::Up | KeyCode::Down if ui.tab == Tab::Levels && !ui::levels_known(s) => {
             ui.status_lines
                 .push("Waiting for the bridge to report the current levels.".into());
+        }
+        // Without a login the bridge refuses the change: ask for the PIN first.
+        KeyCode::Up | KeyCode::Down
+            if ui.tab == Tab::Levels
+                && s.listing.as_ref().is_some_and(|l| l.wants_pin())
+                && !(ui.level == LevelControl::RxGain
+                    && s.status.as_ref().and_then(|st| st.rx_gain_fixed) == Some(true)) =>
+        {
+            ask_for_pin(ui, pin_reason(PinFor::Setting), true);
         }
         KeyCode::Up | KeyCode::Down if ui.tab == Tab::Levels => {
             let up = code == KeyCode::Up;
@@ -607,6 +723,8 @@ pub fn run_tui(args: &Args) -> Result<(), String> {
         alert: None,
         help: false,
         pin_entry: None,
+        pin_reason: None,
+        pin_declined: None,
         status_lines: vec![format!(
             "Bridge {} via {}. {}",
             started.found.addr,
@@ -634,8 +752,20 @@ pub fn run_tui(args: &Args) -> Result<(), String> {
             match r {
                 CommandReply::Refused(why) => announced.push(why),
                 CommandReply::ModeSet(m) => announced.push(format!("Mode set: {}.", m.word())),
+                // A level change was just keyed; rig control is an app retrying.
+                // Locked: a PIN now only meets the lockout again; the Status
+                // tab shows the wait.
+                CommandReply::PinWanted(_)
+                    if matches!(
+                        snapshot.listing,
+                        Some(vbcore::runner::ListingState::Locked(_))
+                    ) => {}
+                CommandReply::PinWanted(why) => {
+                    ask_for_pin(&mut ui, pin_reason(why), why == PinFor::Setting)
+                }
             }
         }
+        note_pin_lost(&mut ui, last_snapshot.as_ref(), &snapshot);
         note_regression(&mut ui, last_snapshot.as_ref(), &snapshot, &announced);
         ui.status_lines.extend(announced);
         ui.status_lines
@@ -672,6 +802,8 @@ pub fn run_tui(args: &Args) -> Result<(), String> {
             rigctl_port_open,
             help: ui.help,
             pin_entry: ui.pin_entry.as_ref().map(|e| e.len()),
+            pin_reason: ui.pin_reason.clone(),
+            bridge_name: bridge_name(&started.found).map(String::from),
         };
         if ui.bell_due {
             ui.bell_due = false;
@@ -761,6 +893,7 @@ mod tests {
             listing: None,
             audio_name: "null".into(),
             audio_fault: None,
+            monitor: None,
             slot_held_by_other: false,
             rig_relay: None,
             local_ip: None,
@@ -778,6 +911,8 @@ mod tests {
             alert: None,
             help: false,
             pin_entry: None,
+            pin_reason: None,
+            pin_declined: None,
             status_lines: Vec::new(),
             bell_due: false,
             quit: false,
@@ -809,6 +944,27 @@ mod tests {
         assert!(u.quit);
     }
 
+    /// `m` asks for the radio monitor on when it is off, and off when it is on,
+    /// from any tab.
+    #[test]
+    fn m_toggles_the_radio_monitor_from_any_tab() {
+        let mut s = snapshot();
+        let mut u = ui();
+        for tab in ['1', '2', '3', '4'] {
+            handle_key(&mut u, &s, KeyCode::Char(tab), KeyModifiers::NONE);
+            assert_eq!(
+                handle_key(&mut u, &s, KeyCode::Char('m'), KeyModifiers::NONE),
+                vec![Command::SetMonitor(true)],
+                "tab {tab}"
+            );
+        }
+        s.monitor = Some("Speakers".into());
+        assert_eq!(
+            handle_key(&mut u, &s, KeyCode::Char('m'), KeyModifiers::NONE),
+            vec![Command::SetMonitor(false)]
+        );
+    }
+
     /// `p` opens the bridge PIN entry: digits go to the PIN (not the tabs), a
     /// short PIN is not sent, Enter sends a 4 to 8 digit one, Esc cancels.
     #[test]
@@ -836,6 +992,157 @@ mod tests {
         assert_eq!(u.pin_entry.as_deref(), Some(""));
         assert!(key(&mut u, KeyCode::Esc).is_empty());
         assert!(u.pin_entry.is_none());
+    }
+
+    /// A level change with no bridge login asks for the PIN, says why, and
+    /// sends nothing; `p` then types it, and the change goes out once it is in.
+    #[test]
+    fn a_level_change_without_the_pin_asks_for_it_and_sends_nothing() {
+        use vbcore::runner::ListingState;
+        let mut s = snapshot();
+        s.listing = Some(ListingState::PinNeeded);
+        let mut u = ui();
+        u.tab = Tab::Levels;
+        u.level_confirmed = true;
+        assert!(handle_key(&mut u, &s, KeyCode::Up, KeyModifiers::NONE).is_empty());
+        assert_eq!(u.pin_reason.as_deref(), Some("to change the levels"));
+        assert!(u.pin_entry.is_none(), "asking takes no keys until p");
+        assert!(u.status_lines.contains(
+            &"The bridge PIN is needed to change the levels: press p to type it.".to_string()
+        ));
+        handle_key(&mut u, &s, KeyCode::Char('p'), KeyModifiers::NONE);
+        assert_eq!(u.pin_entry.as_deref(), Some(""));
+        assert_eq!(u.pin_reason.as_deref(), Some("to change the levels"));
+        for c in "2468".chars() {
+            handle_key(&mut u, &s, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(
+            handle_key(&mut u, &s, KeyCode::Enter, KeyModifiers::NONE),
+            vec![Command::SetPin("2468".into())]
+        );
+        assert!(u.pin_entry.is_none() && u.pin_reason.is_none());
+        s.listing = Some(ListingState::Listed);
+        assert_eq!(
+            handle_key(&mut u, &s, KeyCode::Up, KeyModifiers::NONE).len(),
+            1
+        );
+    }
+
+    /// An app asking (rig control) shows the ask, but not again within a
+    /// minute of Esc; a key the user presses always shows it.
+    #[test]
+    fn an_app_asking_for_the_pin_shows_the_ask_but_not_again_right_after_esc() {
+        let s = snapshot();
+        let mut u = ui();
+        ask_for_pin(&mut u, pin_reason(PinFor::RigControl), false);
+        assert_eq!(
+            u.pin_reason.as_deref(),
+            Some("for rig control (CAT and PTT)")
+        );
+        // A second ask while one shows changes nothing.
+        ask_for_pin(&mut u, pin_reason(PinFor::Setting), true);
+        assert_eq!(
+            u.pin_reason.as_deref(),
+            Some("for rig control (CAT and PTT)")
+        );
+        assert!(handle_key(&mut u, &s, KeyCode::Esc, KeyModifiers::NONE).is_empty());
+        assert!(u.pin_reason.is_none() && u.pin_entry.is_none());
+        ask_for_pin(&mut u, pin_reason(PinFor::RigControl), false);
+        assert!(u.pin_reason.is_none(), "an app retrying does not ask again");
+        ask_for_pin(&mut u, pin_reason(PinFor::Setting), true);
+        assert!(u.pin_reason.is_some());
+        u.pin_reason = None;
+        u.pin_declined = Some(Instant::now() - PIN_ASK_AGAIN);
+        ask_for_pin(&mut u, pin_reason(PinFor::RigControl), false);
+        assert!(u.pin_reason.is_some(), "a minute later it asks again");
+    }
+
+    /// While the PIN is asked for, every key keeps its job: 1 to 4 switch
+    /// tabs (no digit reaches a PIN), Enter picks the next level, `l` goes to
+    /// Listen Only. Only `p` starts typing, and only Esc dismisses it.
+    #[test]
+    fn an_ask_for_the_pin_never_takes_the_other_keys() {
+        let s = snapshot();
+        let mut u = ui();
+        ask_for_pin(&mut u, pin_reason(PinFor::RigControl), false);
+        for (key, tab) in [('2', Tab::Setup), ('3', Tab::Check), ('4', Tab::Levels)] {
+            assert!(handle_key(&mut u, &s, KeyCode::Char(key), KeyModifiers::NONE).is_empty());
+            assert_eq!(u.tab, tab);
+        }
+        assert!(handle_key(&mut u, &s, KeyCode::Enter, KeyModifiers::NONE).is_empty());
+        assert_eq!(u.level, LevelControl::TxGain.next());
+        assert_eq!(
+            handle_key(&mut u, &s, KeyCode::Char('l'), KeyModifiers::NONE),
+            vec![Command::SetMode(Mode::ListenOnly)]
+        );
+        assert!(u.pin_entry.is_none());
+        assert!(u.pin_reason.is_some(), "the ask still shows");
+        // Typing, started with p, takes digits and ignores letters as before.
+        handle_key(&mut u, &s, KeyCode::Char('p'), KeyModifiers::NONE);
+        handle_key(&mut u, &s, KeyCode::Char('1'), KeyModifiers::NONE);
+        assert!(handle_key(&mut u, &s, KeyCode::Char('l'), KeyModifiers::NONE).is_empty());
+        assert_eq!(u.pin_entry.as_deref(), Some("1"));
+    }
+
+    /// The PIN hint names the bridge by the name it was found by, never by
+    /// an address string, which the live address replaces.
+    #[test]
+    fn the_bridge_name_is_a_found_name_not_an_address() {
+        use vbcore::discovery::Via;
+        let found = |host: &str| Found {
+            host: host.into(),
+            addr: "10.42.0.1".parse().unwrap(),
+            via: Via::Given,
+        };
+        assert_eq!(
+            bridge_name(&found("vectorbridge.local")),
+            Some("vectorbridge.local")
+        );
+        assert_eq!(bridge_name(&found("10.42.0.1")), None);
+        assert_eq!(bridge_name(&found("fd00::7")), None);
+        assert_eq!(bridge_name(&found("")), None);
+    }
+
+    /// Fixed RX gain says so, PIN or not.
+    #[test]
+    fn fixed_rx_gain_says_so_without_asking_for_the_pin() {
+        let mut s = snapshot();
+        s.listing = Some(vbcore::runner::ListingState::PinNeeded);
+        let mut u = ui();
+        u.tab = Tab::Levels;
+        u.level = LevelControl::RxGain;
+        assert!(handle_key(&mut u, &s, KeyCode::Up, KeyModifiers::NONE).is_empty());
+        assert!(u.pin_reason.is_none() && u.pin_entry.is_none());
+        assert!(u
+            .status_lines
+            .contains(&"RX gain is fixed on this bridge.".to_string()));
+    }
+
+    /// A login the bridge stops taking asks for the PIN again; the first
+    /// "needs the PIN" at start-up only shows on the Status tab. A login
+    /// clears an ask still showing.
+    #[test]
+    fn a_lost_login_asks_for_the_pin_but_start_up_does_not() {
+        use vbcore::runner::ListingState;
+        let mut was = snapshot();
+        let mut now = snapshot();
+        now.listing = Some(ListingState::PinNeeded);
+        let mut u = ui();
+        note_pin_lost(&mut u, None, &now);
+        note_pin_lost(&mut u, Some(&was), &now);
+        assert!(u.pin_reason.is_none());
+        was.listing = Some(ListingState::Listed);
+        note_pin_lost(&mut u, Some(&was), &now);
+        assert!(u.pin_reason.as_deref().unwrap().starts_with("again"));
+        assert!(u.pin_entry.is_none());
+        note_pin_lost(&mut u, Some(&now), &was);
+        assert!(u.pin_reason.is_none(), "logged in again: the ask goes");
+        // The status region says so when the PIN state changes.
+        assert!(change_lines(Some(&was), &now)
+            .contains(&"Bridge PIN \u{25b2} Check: not entered.".to_string()));
+        assert!(!change_lines(Some(&now), &now)
+            .iter()
+            .any(|l| l.starts_with("Bridge PIN")));
     }
 
     /// The first level change asks for confirmation; later ones go straight out.

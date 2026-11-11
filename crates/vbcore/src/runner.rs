@@ -10,7 +10,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::assembler::{RxAssembler, Stats as RxStats};
-use crate::audio::{peak_dbfs, AudioAdapter, MAX_FRAMES_PER_CALL};
+use crate::audio::{peak_dbfs, AudioAdapter, MonitorEvent, MAX_FRAMES_PER_CALL};
 use crate::clockcheck::ClockEstimate;
 use crate::discovery::resolve;
 use crate::http::{self, HttpOutcome};
@@ -261,6 +261,8 @@ pub struct Snapshot {
     /// The audio adapter's name and its fault, if any.
     pub audio_name: String,
     pub audio_fault: Option<String>,
+    /// The radio monitor's output while it is on (RX audio also plays there).
+    pub monitor: Option<String>,
     /// `status.peer` names an address that is not one of ours.
     pub slot_held_by_other: bool,
     /// The local rig control relay, `None` when not asked for.
@@ -296,6 +298,7 @@ impl Snapshot {
             listing: None,
             audio_name,
             audio_fault: None,
+            monitor: None,
             slot_held_by_other: false,
             rig_relay: None,
             local_ip: None,
@@ -341,6 +344,9 @@ pub enum Command {
     },
     /// A clock estimate from the WSJT-X listener (fed by the app).
     Clock(Option<ClockEstimate>),
+    /// Turns the radio monitor on or off (the `m` key). The result is announced
+    /// and kept in `Snapshot::monitor`.
+    SetMonitor(bool),
     /// The bridge refused the rig control relay's app token, or its missing
     /// one, on 4532 (internal).
     RigTokenRefused,
@@ -351,6 +357,18 @@ pub enum Command {
 pub enum CommandReply {
     ModeSet(Mode),
     Refused(String),
+    /// Something the user tried needs the bridge PIN and VectorCable holds no
+    /// token the bridge takes, so the UI asks for it.
+    PinWanted(PinFor),
+}
+
+/// What the bridge PIN was wanted for, in [`CommandReply::PinWanted`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinFor {
+    /// A level change (gain or the TX audio cap).
+    Setting,
+    /// An app's rig control through the relay on 4532.
+    RigControl,
 }
 
 pub struct Runner {
@@ -531,10 +549,15 @@ fn relay_source(
     auth: Arc<Mutex<Auth>>,
 ) -> rigrelay::Source {
     Arc::new(move || {
-        let (ip, port, vb_auth) = {
+        let (ip, port, vb_auth, listen_only) = {
             let snap = snapshot.lock().unwrap();
             let (port, vb_auth) = snap.relay_rigctl.unwrap_or((rig_port, false));
-            (snap.bridge.ip(), port, vb_auth)
+            (
+                snap.bridge.ip(),
+                port,
+                vb_auth,
+                snap.mode == Mode::ListenOnly,
+            )
         };
         let token = if vb_auth {
             let a = auth.lock().unwrap();
@@ -546,6 +569,7 @@ fn relay_source(
             addr: SocketAddr::new(ip, port),
             token,
             vb_auth,
+            listen_only,
         }
     })
 }
@@ -695,10 +719,13 @@ impl Worker {
                         request, answer, ..
                     }) => match answer {
                         Authed::PinRequired { pin_set } => {
+                            if pin_set {
+                                let _ = self.replies.send(CommandReply::PinWanted(PinFor::Setting));
+                            }
                             actions.push(Action::Announce(
                                 if pin_set {
-                                    "The bridge needs its PIN for that change: press p, enter \
-                                     it, then make the change again."
+                                    "The bridge needs its PIN for that change: enter it (p), \
+                                     then make the change again."
                                 } else {
                                     "The bridge has no PIN yet: set one on its web page, then \
                                      make the change again."
@@ -765,6 +792,12 @@ impl Worker {
                             let snap = self.snapshot.lock().unwrap();
                             snap.listing.as_ref().is_some_and(|l| l.wants_pin())
                         };
+                        // No token held: the PIN is all that is missing, so ask for it.
+                        if asking {
+                            let _ = self
+                                .replies
+                                .send(CommandReply::PinWanted(PinFor::RigControl));
+                        }
                         let due = self
                             .rig_token_checked
                             .is_none_or(|at| at.elapsed() >= RIG_TOKEN_CHECK_EVERY);
@@ -792,8 +825,33 @@ impl Worker {
                         }
                     }
                     Ok(Command::Clock(estimate)) => clock_estimate = estimate,
+                    // Returns at once; the outcome is polled below.
+                    Ok(Command::SetMonitor(on)) if self.audio.monitor_supported() => {
+                        self.audio.set_monitor(on)
+                    }
+                    Ok(Command::SetMonitor(on)) => {
+                        if on {
+                            actions.push(Action::Announce(
+                                "Radio monitor not available with this audio adapter.".into(),
+                            ));
+                        }
+                    }
                     Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
                 }
+            }
+
+            // The radio monitor's outcomes, from the adapter's own thread.
+            while let Some(event) = self.audio.monitor_event() {
+                let (monitor, said) = match event {
+                    MonitorEvent::On(name) => {
+                        let said = format!("Radio monitor on: {name}.");
+                        (Some(name), said)
+                    }
+                    MonitorEvent::Off => (None, "Radio monitor off.".into()),
+                    MonitorEvent::Refused(why) => (None, format!("Radio monitor off: {why}.")),
+                };
+                self.snapshot.lock().unwrap().monitor = monitor;
+                actions.push(Action::Announce(said));
             }
 
             // Datagrams from the bridge.

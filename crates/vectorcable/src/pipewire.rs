@@ -24,7 +24,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 
-use vbcore::audio::{AudioAdapter, MAX_CATCH_UP_FRAMES};
+use vbcore::audio::{AudioAdapter, MonitorEvent, MonitorWorker, MAX_CATCH_UP_FRAMES};
 use vbcore::protocol::SAMPLE_RATE;
 use vbcore::time::LocalTime;
 
@@ -165,6 +165,296 @@ pub struct PipeWireAdapter {
     pipe_fault: Shared<Option<String>>,
     started: Option<LocalTime>,
     rx_consumed: u64,
+    /// Starts and stops the radio monitor off the RX loop; `None` when its
+    /// thread could not start (then there is no monitor).
+    monitor: Option<MonitorWorker>,
+    /// Where `write_rx` sends a copy of the RX audio while the monitor is on.
+    monitor_tap: MonitorTap,
+}
+
+/// The monitor's feed: `None` while it is off. `write_rx` never waits on it.
+type MonitorTap = Shared<Option<mpsc::SyncSender<Vec<i16>>>>;
+
+/// RX blocks (about 10 ms each) queued for the monitor before newer ones are
+/// dropped: the output's clock runs slow against ours, so what you hear has a
+/// short gap now and then, and the delay stays bounded. The cable is not
+/// touched.
+const MONITOR_QUEUE_BLOCKS: usize = 4;
+/// The monitor pipe's size in bytes (about 43 ms of audio), so a stalled
+/// output cannot build up seconds of delay in the pipe.
+const MONITOR_PIPE_BYTES: i32 = 4096;
+
+/// The radio monitor's stream: `pacat` playing the RX audio on `sink`, the
+/// default output when `m` was pressed. It is a stream of its own, never
+/// linked to the RX cable's sink, so the output's clock cannot pace the
+/// cable. It may not move, reconnect or fall back to another output, so a
+/// later default change, or the output going away, cannot turn it into a
+/// loop into VectorBridge TX.
+pub fn monitor_args(sink: &str) -> Vec<String> {
+    vec![
+        "--playback".into(),
+        format!("--device={sink}"),
+        "--raw".into(),
+        "--rate=48000".into(),
+        "--channels=1".into(),
+        "--format=s16le".into(),
+        "--latency-msec=60".into(),
+        "--client-name=VectorCable".into(),
+        "--stream-name=VectorCable radio monitor".into(),
+        "--property=node.dont-move=true".into(),
+        "--property=node.dont-reconnect=true".into(),
+        "--property=node.dont-fallback=true".into(),
+    ]
+}
+
+/// One node of the PipeWire graph, as the monitor's check sees it.
+struct GraphNode {
+    id: u64,
+    serial: Option<String>,
+    name: String,
+    description: Option<String>,
+    link_group: Option<String>,
+    /// The `target.object` (or older `node.target`) a stream asks for.
+    targets: Vec<String>,
+}
+
+/// A property as text, whether `pw-dump` gives it as a string or a number.
+fn prop_text(props: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    match props.get(key)? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Whether `sink` may carry the monitor: the display name to show, or why
+/// not. `dump` is `pw-dump` output, the whole PipeWire graph. Everything the
+/// sink feeds is followed: its links (from its monitor too), the other nodes
+/// of its link group (a combined sink's member streams, a loopback's other
+/// half, a filter's output) and any stream's target. Refused when any of it
+/// is a VectorBridge device, since the monitor would then reach VectorBridge
+/// TX; also when the sink is not in the graph, since then it cannot be
+/// checked.
+pub fn check_monitor_output(dump: &str, sink: &str) -> Result<String, String> {
+    let objects: Vec<serde_json::Value> =
+        serde_json::from_str(dump).map_err(|e| format!("cannot read the PipeWire graph: {e}"))?;
+    let mut nodes: Vec<GraphNode> = Vec::new();
+    let mut links: Vec<(u64, u64)> = Vec::new();
+    for o in &objects {
+        let (Some(kind), Some(id)) = (o["type"].as_str(), o["id"].as_u64()) else {
+            continue;
+        };
+        let info = &o["info"];
+        match kind {
+            "PipeWire:Interface:Node" => {
+                let Some(props) = info["props"].as_object() else {
+                    continue;
+                };
+                nodes.push(GraphNode {
+                    id,
+                    serial: prop_text(props, "object.serial"),
+                    name: prop_text(props, "node.name").unwrap_or_default(),
+                    description: prop_text(props, "node.description")
+                        .or_else(|| prop_text(props, "node.nick")),
+                    link_group: prop_text(props, "node.link-group"),
+                    targets: ["target.object", "node.target"]
+                        .iter()
+                        .filter_map(|k| prop_text(props, k))
+                        .collect(),
+                });
+            }
+            "PipeWire:Interface:Link" => {
+                if let (Some(from), Some(to)) = (
+                    info["output-node-id"].as_u64(),
+                    info["input-node-id"].as_u64(),
+                ) {
+                    links.push((from, to));
+                }
+            }
+            _ => {}
+        }
+    }
+    let start = nodes
+        .iter()
+        .find(|n| n.name == sink)
+        .ok_or_else(|| format!("cannot find the sound output {sink} to check it"))?;
+    let shown = start
+        .description
+        .clone()
+        .unwrap_or_else(|| sink.to_string());
+    for id in [sink, shown.as_str()] {
+        if let Some(why) = vbcore::audio::monitor_output_refused(id) {
+            return Err(why);
+        }
+    }
+    let mut seen = vec![start.id];
+    let mut todo = vec![start.id];
+    while let Some(id) = todo.pop() {
+        let Some(node) = nodes.iter().find(|n| n.id == id) else {
+            continue;
+        };
+        let mentions = |t: &str| t.to_ascii_lowercase().contains("vectorbridge");
+        if id != start.id
+            && (mentions(&node.name) || node.description.as_deref().is_some_and(mentions))
+        {
+            return Err(format!(
+                "{shown} includes a VectorBridge device; choose speakers or headphones as the sound output"
+            ));
+        }
+        let mut next: Vec<u64> = links
+            .iter()
+            .filter(|(from, _)| *from == id)
+            .map(|(_, to)| *to)
+            .collect();
+        if let Some(group) = &node.link_group {
+            next.extend(
+                nodes
+                    .iter()
+                    .filter(|n| n.link_group.as_ref() == Some(group))
+                    .map(|n| n.id),
+            );
+        }
+        for target in &node.targets {
+            next.extend(
+                nodes
+                    .iter()
+                    .filter(|n| &n.name == target || n.serial.as_ref() == Some(target))
+                    .map(|n| n.id),
+            );
+        }
+        for n in next {
+            if !seen.contains(&n) {
+                seen.push(n);
+                todo.push(n);
+            }
+        }
+    }
+    Ok(shown)
+}
+
+/// The PipeWire graph, as JSON.
+fn pw_dump() -> Result<String, String> {
+    let out = Command::new("pw-dump").output().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "pw-dump not found: install PipeWire's tools (Debian and Ubuntu: pipewire-bin) so the sound output can be checked".to_string()
+        } else {
+            format!("pw-dump: {e}")
+        }
+    })?;
+    if !out.status.success() {
+        return Err(format!(
+            "pw-dump: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The monitor's `pacat` while it is on; dropping it stops the stream, and
+/// the thread feeding it ends with the pipe.
+struct MonitorPlayer {
+    helper: Helper,
+}
+
+impl Drop for MonitorPlayer {
+    fn drop(&mut self) {
+        let _ = self.helper.child.kill();
+        let _ = self.helper.child.wait();
+    }
+}
+
+/// Keeps the monitor pipe small; if the kernel refuses, the default stands.
+#[cfg(target_os = "linux")]
+fn shrink_pipe(pipe: &std::process::ChildStdin) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: F_SETPIPE_SZ on a pipe this process holds open; it only
+    // changes the pipe's capacity.
+    unsafe {
+        libc::fcntl(pipe.as_raw_fd(), libc::F_SETPIPE_SZ, MONITOR_PIPE_BYTES);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn shrink_pipe(_pipe: &std::process::ChildStdin) {}
+
+/// Starts the monitor on the current default output, after the check: the
+/// player and the output's display name. The tap is set last, once the
+/// stream has started.
+fn start_monitor(tap: &MonitorTap) -> Result<(MonitorPlayer, String), String> {
+    let sink = pactl_out(&["get-default-sink"])?.trim().to_string();
+    if sink.is_empty() {
+        return Err("no default sound output is set".into());
+    }
+    let name = check_monitor_output(&pw_dump()?, &sink)?;
+    let helper = Helper::spawn("pacat", &monitor_args(&sink), Stdio::piped(), Stdio::null())
+        .map_err(|e| e.to_string())?;
+    let mut player = MonitorPlayer { helper };
+    let stdin = player
+        .helper
+        .child
+        .stdin
+        .take()
+        .ok_or("pacat has no input pipe")?;
+    shrink_pipe(&stdin);
+    // A stream that cannot open its output (it may not fall back) exits.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    if let Some(why) = player.helper.fault() {
+        return Err(why);
+    }
+    let (feed, queue) = mpsc::sync_channel::<Vec<i16>>(MONITOR_QUEUE_BLOCKS);
+    let mut stdin = stdin;
+    std::thread::Builder::new()
+        .name("vectorcable-pw-monitor".into())
+        .spawn(move || {
+            for block in queue {
+                let bytes: Vec<u8> = block.iter().flat_map(|s| s.to_le_bytes()).collect();
+                if stdin.write_all(&bytes).is_err() {
+                    return;
+                }
+            }
+        })
+        .map_err(|e| format!("cannot start the radio monitor: {e}"))?;
+    *tap.lock().unwrap() = Some(feed);
+    Ok((player, name))
+}
+
+/// The monitor worker: whatever is playing stops first (the feed, then the
+/// stream), so a repeat `on` re-picks the current default output; the last
+/// `apply(false)` (on drop) stops it for good.
+fn spawn_monitor(tap: MonitorTap) -> Option<MonitorWorker> {
+    let mut playing: Option<MonitorPlayer> = None;
+    MonitorWorker::spawn(move |on| {
+        *tap.lock().unwrap() = None;
+        drop(playing.take());
+        if !on {
+            return MonitorEvent::Off;
+        }
+        match start_monitor(&tap) {
+            Ok((player, name)) => {
+                playing = Some(player);
+                MonitorEvent::On(name)
+            }
+            Err(why) => MonitorEvent::Refused(why),
+        }
+    })
+    .ok()
+}
+
+/// `pactl` stdout, in English field names whatever the locale.
+fn pactl_out(args: &[&str]) -> Result<String, String> {
+    let out = Command::new("pactl")
+        .env("LC_ALL", "C")
+        .args(args)
+        .output()
+        .map_err(|e| helper_error("pactl", e).to_string())?;
+    if !out.status.success() {
+        return Err(format!(
+            "pactl {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn load_module(args: &[&str]) -> std::io::Result<String> {
@@ -251,6 +541,7 @@ impl PipeWireAdapter {
             }
         };
         let pipe_fault: Shared<Option<String>> = Arc::new(Mutex::new(None));
+        let monitor_tap: MonitorTap = Arc::new(Mutex::new(None));
         let (rx_writer, rx_queue) = mpsc::channel::<Vec<i16>>();
         let mut spawned: Vec<std::io::Result<()>> = Vec::new();
         if let Some(mut stdin) = play.child.stdin.take() {
@@ -323,6 +614,8 @@ impl PipeWireAdapter {
             pipe_fault,
             started: None,
             rx_consumed: 0,
+            monitor: spawn_monitor(monitor_tap.clone()),
+            monitor_tap,
         })
     }
 
@@ -378,11 +671,33 @@ impl AudioAdapter for PipeWireAdapter {
 
     fn write_rx(&mut self, samples: &[i16]) {
         let _ = self.rx_writer.send(samples.to_vec());
+        // A full queue drops the block: a gap in the monitor, never in the cable.
+        if let Some(feed) = self.monitor_tap.lock().unwrap().as_ref() {
+            let _ = feed.try_send(samples.to_vec());
+        }
+    }
+
+    fn monitor_supported(&self) -> bool {
+        self.monitor.is_some()
+    }
+
+    /// `pactl` runs on the monitor's own thread, never on the RX loop.
+    fn set_monitor(&mut self, on: bool) {
+        if let Some(m) = &self.monitor {
+            m.request(on);
+        }
+    }
+
+    fn monitor_event(&mut self) -> Option<MonitorEvent> {
+        self.monitor.as_ref().and_then(MonitorWorker::event)
     }
 }
 
 impl Drop for PipeWireAdapter {
     fn drop(&mut self) {
+        // The monitor stops first: dropping the worker stops its stream and
+        // waits.
+        drop(self.monitor.take());
         for helper in [&self.play, &self.rec] {
             let mut h = helper.lock().unwrap();
             let _ = h.child.kill();
@@ -433,5 +748,197 @@ mod tests {
         assert!(helper_error("parec", denied)
             .to_string()
             .starts_with("parec: "));
+    }
+
+    #[test]
+    fn the_monitor_is_its_own_stream_that_never_moves_or_falls_back() {
+        let args = monitor_args("alsa_output.pci-0000_00_1b.0.analog-stereo");
+        assert_eq!(args[0], "--playback");
+        assert!(args.contains(&"--device=alsa_output.pci-0000_00_1b.0.analog-stereo".to_string()));
+        for p in ["dont-move", "dont-reconnect", "dont-fallback"] {
+            assert!(args.contains(&format!("--property=node.{p}=true")), "{p}");
+        }
+        // Never a module linking the RX cable's sink to the output.
+        assert!(!args.iter().any(|a| a.contains(RX_SINK)));
+    }
+
+    /// A `pw-dump` shaped graph: the built-in output; VectorBridge TX; a
+    /// combined sink whose member streams (one linked, one only targeted) go
+    /// to the built-in output and to TX; headphones whose monitor a loopback
+    /// plays into TX; and a node with no info.
+    const GRAPH: &str = r#"[
+        {"id": 5, "type": "PipeWire:Interface:Node", "info": null},
+        {"id": 57, "type": "PipeWire:Interface:Node", "info": {"props": {
+            "node.name": "alsa_output.pci-0000_00_1b.0.analog-stereo",
+            "node.description": "Built-in Audio Analog Stereo", "object.serial": 57}}},
+        {"id": 82, "type": "PipeWire:Interface:Node", "info": {"props": {
+            "node.name": "vectorbridge_tx", "node.description": "VectorBridge TX",
+            "object.serial": 340}}},
+        {"id": 91, "type": "PipeWire:Interface:Node", "info": {"props": {
+            "node.name": "combined", "node.description": "Simultaneous output",
+            "node.link-group": "combine-sink-1-13"}}},
+        {"id": 77, "type": "PipeWire:Interface:Node", "info": {"props": {
+            "node.name": "output.combined_alsa", "node.link-group": "combine-sink-1-13",
+            "target.object": "alsa_output.pci-0000_00_1b.0.analog-stereo"}}},
+        {"id": 69, "type": "PipeWire:Interface:Node", "info": {"props": {
+            "node.name": "output.combined_2", "node.link-group": "combine-sink-1-13",
+            "target.object": "340"}}},
+        {"id": 100, "type": "PipeWire:Interface:Link",
+            "info": {"output-node-id": 77, "input-node-id": 57}},
+        {"id": 60, "type": "PipeWire:Interface:Node", "info": {"props": {
+            "node.name": "bluez_output.headphones", "node.nick": "Headphones"}}},
+        {"id": 61, "type": "PipeWire:Interface:Node", "info": {"props": {
+            "node.name": "input.loopback-1", "node.link-group": "loopback-1-2"}}},
+        {"id": 62, "type": "PipeWire:Interface:Node", "info": {"props": {
+            "node.name": "output.loopback-1", "node.link-group": "loopback-1-2"}}},
+        {"id": 102, "type": "PipeWire:Interface:Link",
+            "info": {"output-node-id": 60, "input-node-id": 61}},
+        {"id": 103, "type": "PipeWire:Interface:Link",
+            "info": {"output-node-id": 62, "input-node-id": 82}}
+    ]"#;
+
+    #[test]
+    fn the_monitor_plays_on_an_ordinary_output_and_shows_its_description() {
+        assert_eq!(
+            check_monitor_output(GRAPH, "alsa_output.pci-0000_00_1b.0.analog-stereo"),
+            Ok("Built-in Audio Analog Stereo".into())
+        );
+    }
+
+    #[test]
+    fn the_monitor_refuses_any_output_that_reaches_vectorbridge() {
+        let why = check_monitor_output(GRAPH, "vectorbridge_tx").unwrap_err();
+        assert!(why.contains("is a VectorBridge device"), "{why}");
+        // A combined sink lists no members; its link group and their
+        // targets lead to TX.
+        let why = check_monitor_output(GRAPH, "combined").unwrap_err();
+        assert!(
+            why.starts_with("Simultaneous output includes a VectorBridge device"),
+            "{why}"
+        );
+        // A loopback from the headphones' monitor plays into TX.
+        let why = check_monitor_output(GRAPH, "bluez_output.headphones").unwrap_err();
+        assert!(
+            why.starts_with("Headphones includes a VectorBridge device"),
+            "{why}"
+        );
+        // Not in the graph, or no graph: it cannot be checked, so it is refused.
+        assert!(check_monitor_output(GRAPH, "missing").is_err());
+        assert!(check_monitor_output("", "alsa_output.x").is_err());
+    }
+
+    /// The `pw-dump` node named `name`, if any.
+    #[cfg(target_os = "linux")]
+    fn live_node(name_key: &str, name: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+        let dump: Vec<serde_json::Value> = serde_json::from_str(&pw_dump().unwrap()).unwrap();
+        dump.into_iter()
+            .filter(|o| o["type"] == "PipeWire:Interface:Node")
+            .filter_map(|o| o["info"]["props"].as_object().cloned())
+            .find(|p| p.get(name_key).and_then(|v| v.as_str()) == Some(name))
+    }
+
+    /// Live, on this machine's PipeWire: makes the cables, turns the monitor
+    /// on and off, and checks its stream comes and goes, may not move, and
+    /// leaves the RX sink's clock alone, while the calls on the RX loop's side
+    /// never wait. Plays only silence.
+    /// `cargo test -p vectorcable pipewire -- --ignored`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn the_monitor_plays_its_own_stream_live() {
+        use std::time::{Duration, Instant};
+        const STREAM: &str = "VectorCable radio monitor";
+        let streams = || {
+            let dump: Vec<serde_json::Value> = serde_json::from_str(&pw_dump().unwrap()).unwrap();
+            dump.iter()
+                .filter(|o| o["type"] == "PipeWire:Interface:Node")
+                .filter(|o| o["info"]["props"]["media.name"] == STREAM)
+                .count()
+        };
+        // The RX sink's id, and the driver of a stream into it (the cable's
+        // own `pacat`): the same while the RX sink keeps its own clock.
+        let rx_clock = || {
+            let id = |p: serde_json::Map<String, serde_json::Value>, k: &str| {
+                p.get(k).and_then(|v| v.as_u64())
+            };
+            let sink = live_node("node.name", RX_SINK).and_then(|p| id(p, "object.id"));
+            let stream = live_node("target.object", RX_SINK).and_then(|p| id(p, "node.driver-id"));
+            (sink, stream)
+        };
+        // Asks, then polls as the runner does, timing the RX-side calls.
+        let ask = |a: &mut PipeWireAdapter, on: bool| {
+            let t = Instant::now();
+            a.set_monitor(on);
+            let mut slowest = t.elapsed();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let t = Instant::now();
+                a.write_rx(&[0; 480]);
+                let e = a.monitor_event();
+                slowest = slowest.max(t.elapsed());
+                if let Some(e) = e {
+                    assert!(
+                        slowest < Duration::from_millis(2),
+                        "RX side waited {slowest:?}"
+                    );
+                    return e;
+                }
+                assert!(Instant::now() < deadline, "no monitor event");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let before = streams();
+        let mut a = PipeWireAdapter::new().expect("cables made");
+        assert!(a.monitor_supported());
+        a.write_rx(&vec![0; 48_000 * 6]);
+        std::thread::sleep(Duration::from_millis(500));
+        let (rx_sink, rx_driver) = rx_clock();
+        assert!(
+            rx_sink.is_some() && rx_driver == rx_sink,
+            "the RX sink drives its own stream: {:?}",
+            rx_clock()
+        );
+        let MonitorEvent::On(name) = ask(&mut a, true) else {
+            panic!("monitor did not start")
+        };
+        let sink = pactl_out(&["get-default-sink"]).unwrap().trim().to_string();
+        std::thread::sleep(Duration::from_millis(500));
+        let output = live_node("node.name", &sink).and_then(|p| p.get("object.id")?.as_u64());
+        eprintln!(
+            "monitor on: {name}; RX (sink, stream driver) {:?}; output {sink} id {output:?}",
+            rx_clock()
+        );
+        assert_eq!(streams(), before + 1);
+        // The cable keeps its own clock: the RX stream still follows the RX
+        // sink, not the output.
+        assert_eq!(
+            rx_clock(),
+            (rx_sink, rx_driver),
+            "the monitor re-clocked RX"
+        );
+        assert_ne!(rx_driver, output);
+        let stream = live_node("media.name", STREAM).expect("monitor stream");
+        for p in [
+            "node.dont-move",
+            "node.dont-reconnect",
+            "node.dont-fallback",
+        ] {
+            let v = stream.get(p);
+            assert!(
+                v == Some(&serde_json::Value::Bool(true))
+                    || v.and_then(|v| v.as_str()) == Some("true"),
+                "{p}: {stream:?}"
+            );
+        }
+        // A repeat on re-picks the output and leaves one stream, not two.
+        assert!(matches!(ask(&mut a, true), MonitorEvent::On(_)));
+        assert_eq!(streams(), before + 1);
+        assert_eq!(ask(&mut a, false), MonitorEvent::Off);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(streams(), before);
+        assert!(matches!(ask(&mut a, true), MonitorEvent::On(_)));
+        drop(a);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(streams(), before, "drop stops the stream");
     }
 }

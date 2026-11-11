@@ -9,16 +9,17 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use vbcore::audio::NullAdapter;
+use vbcore::audio::{AudioAdapter, MonitorEvent, MonitorWorker, NullAdapter};
 use vbcore::pin::TokenStore;
 use vbcore::protocol::{Direction, Packet, SAMPLES_PER_PACKET};
 use vbcore::rigrelay::RelayState;
-use vbcore::runner::{Command, CommandReply, Config, ListingState, Runner};
+use vbcore::runner::{Command, CommandReply, Config, ListingState, PinFor, Runner};
 use vbcore::session::{Link, Mode};
+use vbcore::time::LocalTime;
 
 const PEER_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_MONITORS: usize = 2;
@@ -445,23 +446,20 @@ impl FakeWeb {
                     (text.starts_with("GET /api/rigctl "), rigctl_body)
                 {
                     format!("HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{b}")
-                } else if text.starts_with("GET /api/status ") && device_id.is_some() {
+                } else if let (true, Some(id)) = (text.starts_with("GET /api/status "), device_id) {
+                    format!("HTTP/1.0 200 OK\r\n\r\n{{\"ok\":true,\"device_id\":\"{id}\"}}")
+                } else if let (true, Some(id)) = (
+                    text.starts_with("POST /api/login ")
+                        && login["pin"] == pin.unwrap_or_default()
+                        && login["app"].is_string(),
+                    device_id,
+                ) {
                     format!(
-                        "HTTP/1.0 200 OK\r\n\r\n{{\"ok\":true,\"device_id\":\"{}\"}}",
-                        device_id.unwrap()
+                        "HTTP/1.0 200 OK\r\n\r\n{{\"ok\":true,\"token\":\"app-token\",\"app\":{},\"device_id\":\"{id}\"}}",
+                        login["app"]
                     )
-                } else if text.starts_with("POST /api/login ")
-                    && device_id.is_some()
-                    && login["pin"] == pin.unwrap_or_default()
-                    && login["app"].is_string()
-                {
-                    format!(
-                        "HTTP/1.0 200 OK\r\n\r\n{{\"ok\":true,\"token\":\"app-token\",\"app\":{},\"device_id\":\"{}\"}}",
-                        login["app"],
-                        device_id.unwrap()
-                    )
-                } else if text.starts_with("POST /api/login ") && pin.is_some() {
-                    if body == format!("{{\"pin\":\"{}\"}}", pin.unwrap()) {
+                } else if let (true, Some(p)) = (text.starts_with("POST /api/login "), pin) {
+                    if body == format!("{{\"pin\":\"{p}\"}}") {
                         "HTTP/1.0 200 OK\r\n\r\n{\"ok\":true,\"token\":\"fake-token\"}".to_string()
                     } else {
                         "HTTP/1.0 401 Unauthorized\r\n\r\n{\"ok\":false,\"error\":\"bad_pin\"}"
@@ -710,8 +708,7 @@ fn transmit_on_the_wire_hello_then_gated_audio_then_keepalives_then_bye() {
     let last_audio = seen
         .tx
         .iter()
-        .filter(|(p, _, _)| !p.is_keepalive())
-        .next_back()
+        .rfind(|(p, _, _)| !p.is_keepalive())
         .unwrap()
         .2;
     assert!(!keepalives
@@ -1251,6 +1248,11 @@ fn settings_go_over_http_with_the_token_and_never_over_udp() {
     assert!(wait_for(Duration::from_secs(3), || {
         announced(&runner, &mut said, "needs its PIN for that change")
     }));
+    // The UI is asked to open the PIN entry.
+    assert_eq!(
+        runner.replies.recv_timeout(Duration::from_secs(1)),
+        Ok(CommandReply::PinWanted(PinFor::Setting))
+    );
     assert!(web.settings().is_empty());
 
     runner.command(Command::SetPin("2468".into()));
@@ -1468,6 +1470,37 @@ fn refusing_rig() -> u16 {
     port
 }
 
+/// No token held and the bridge wants one on 4532: an app's refused try asks
+/// the UI for the PIN.
+#[test]
+fn an_app_refused_on_4532_with_no_token_has_the_ui_ask_for_the_pin() {
+    let bridge = FakeBridge::start(false);
+    let web = FakeWeb::start_1_8("2468", "fedcba9876543210");
+    let body =
+        serde_json::json!({"ok": true, "access": "wifi", "port": refusing_rig(), "vb_auth": true});
+    web.set_rigctl(body.to_string());
+    let mut cfg = config(&bridge, Mode::ListenOnly);
+    cfg.http_port = Some(web.port);
+    cfg.rig_relay = Some("127.0.0.1:0".parse().unwrap());
+    let runner = Runner::spawn(cfg, Box::new(NullAdapter::new())).unwrap();
+    assert!(wait_for(Duration::from_secs(5), || {
+        let s = runner.snapshot();
+        s.listing == Some(ListingState::PinNeeded) && s.relay_rigctl.is_some()
+    }));
+    let Some(RelayState::Listening(relay)) = runner.snapshot().rig_relay else {
+        panic!("relay: {:?}", runner.snapshot().rig_relay);
+    };
+    let mut app = std::net::TcpStream::connect(relay).unwrap();
+    app.write_all(b"f\n").unwrap();
+    assert_eq!(
+        runner.replies.recv_timeout(Duration::from_secs(5)),
+        Ok(CommandReply::PinWanted(PinFor::RigControl))
+    );
+    let _ = runner.stop();
+    bridge.stop();
+    web.stop();
+}
+
 /// The token revoked on the bridge: its refusal on 4532 has the token checked,
 /// which forgets it and asks for the PIN, without the user doing anything.
 #[test]
@@ -1541,4 +1574,116 @@ fn a_bridge_without_the_settings_endpoints_gets_them_over_udp() {
     let _ = runner.stop();
     bridge.stop();
     web.stop();
+}
+
+/// A null adapter with a radio monitor whose output takes 300 ms to open (as
+/// a Bluetooth one can), counting the RX frames written meanwhile.
+struct MonitorAdapter {
+    inner: NullAdapter,
+    worker: MonitorWorker,
+    rx_written: Arc<AtomicU64>,
+}
+
+impl MonitorAdapter {
+    fn new(rx_written: Arc<AtomicU64>, opening: Arc<AtomicBool>) -> MonitorAdapter {
+        let worker = MonitorWorker::spawn(move |on| {
+            if !on {
+                return MonitorEvent::Off;
+            }
+            opening.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(300));
+            opening.store(false, Ordering::SeqCst);
+            MonitorEvent::On("Test Speakers".into())
+        })
+        .unwrap();
+        MonitorAdapter {
+            inner: NullAdapter::new(),
+            worker,
+            rx_written,
+        }
+    }
+}
+
+impl AudioAdapter for MonitorAdapter {
+    fn name(&self) -> &str {
+        "monitor-test"
+    }
+    fn rx_demand(&mut self, now: LocalTime) -> usize {
+        self.inner.rx_demand(now)
+    }
+    fn read_tx(&mut self, now: LocalTime, out: &mut [i16]) -> usize {
+        self.inner.read_tx(now, out)
+    }
+    fn write_rx(&mut self, samples: &[i16]) {
+        self.rx_written
+            .fetch_add(samples.len() as u64, Ordering::SeqCst);
+        self.inner.write_rx(samples)
+    }
+    fn monitor_supported(&self) -> bool {
+        true
+    }
+    fn set_monitor(&mut self, on: bool) {
+        self.worker.request(on)
+    }
+    fn monitor_event(&mut self) -> Option<MonitorEvent> {
+        self.worker.event()
+    }
+}
+
+#[test]
+fn the_radio_monitor_turns_on_and_off_without_stalling_rx_and_says_why_when_it_cannot() {
+    let bridge = FakeBridge::start(false);
+    let rx_written = Arc::new(AtomicU64::new(0));
+    let opening = Arc::new(AtomicBool::new(false));
+    let adapter = MonitorAdapter::new(rx_written.clone(), opening.clone());
+    let runner = Runner::spawn(config(&bridge, Mode::ListenOnly), Box::new(adapter)).unwrap();
+    assert_eq!(runner.snapshot().monitor, None, "off at start");
+    runner.command(Command::SetMonitor(true));
+    assert!(wait_for(Duration::from_secs(2), || opening.load(Ordering::SeqCst)));
+    // While the output opens, the RX loop keeps writing on time.
+    let at_start = rx_written.load(Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(opening.load(Ordering::SeqCst), "still opening");
+    let during = rx_written.load(Ordering::SeqCst) - at_start;
+    assert!(during >= 7_200, "RX stalled: {during} frames in 200 ms");
+    assert!(wait_for(Duration::from_secs(2), || {
+        runner.snapshot().monitor.as_deref() == Some("Test Speakers")
+    }));
+    runner.command(Command::SetMonitor(false));
+    assert!(wait_for(Duration::from_secs(2), || runner
+        .snapshot()
+        .monitor
+        .is_none()));
+    // Announcements go out after the snapshot changes, so wait for both.
+    let mut announced: Vec<String> = Vec::new();
+    assert!(
+        wait_for(Duration::from_secs(2), || {
+            announced.extend(runner.announcements.try_iter());
+            announced.contains(&"Radio monitor on: Test Speakers.".to_string())
+                && announced.contains(&"Radio monitor off.".to_string())
+        }),
+        "{announced:?}"
+    );
+    let _ = runner.stop();
+    let _ = bridge.stop();
+
+    // An adapter without a monitor refuses, and the snapshot stays off.
+    let bridge = FakeBridge::start(false);
+    let runner = Runner::spawn(
+        config(&bridge, Mode::ListenOnly),
+        Box::new(NullAdapter::new()),
+    )
+    .unwrap();
+    runner.command(Command::SetMonitor(true));
+    let mut refused = false;
+    assert!(wait_for(Duration::from_secs(2), || {
+        refused |= runner
+            .announcements
+            .try_iter()
+            .any(|a| a == "Radio monitor not available with this audio adapter.");
+        refused
+    }));
+    assert_eq!(runner.snapshot().monitor, None);
+    let _ = runner.stop();
+    let _ = bridge.stop();
 }

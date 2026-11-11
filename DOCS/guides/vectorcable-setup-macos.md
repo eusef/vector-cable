@@ -27,8 +27,7 @@ audio plug-ins. The installer checks the package against the bridge's manifest b
 With internet instead of the bridge, the same installer runs from GitHub:
 
 ```
-B=https://github.com/eusef/vector-cable/releases/latest/download
-curl -fsSL $B/install-mac.sh | VECTORCABLE_BASE=$B sh
+curl -fsSL https://github.com/eusef/vector-cable/releases/latest/download/install-mac.sh | VECTORCABLE_BASE=https://github.com/eusef/vector-cable/releases/latest/download sh
 ```
 
 Prefer a download? The Downloads page has the `.pkg`. Because the beta package is not notarized,
@@ -52,10 +51,37 @@ macOS blocks the first open: go to System Settings, Privacy and Security, and pr
 `vectorcable doctor` tests the driver, the Microphone permission and the bridge, and prints a
 fix for each row that is not Good.
 
+## Listen to the radio
+
+Press `m` to hear the radio on the Mac's sound output (speakers or headphones) while the apps
+decode; press `m` again to stop. It uses the output chosen in System Settings, Sound, when you
+press it, and the Mac's volume sets the level. Status shows it on the Monitor row. It is off each
+time VectorCable starts, and the apps' audio is the same either way.
+
+## Upgrade
+
+1. Quit VectorCable and your radio apps.
+2. Run the install line again, from the bridge or from GitHub. It checks the download and
+   installs it over the old one; your settings and the bridge log-in are kept. The bridge line
+   installs the version that bridge carries; the GitHub line installs the newest release.
+3. Type your Mac password when asked. Audio pauses for a few seconds as at install.
+4. `vectorcable version` shows the version you now have.
+5. If you saved a bridge log-in (a bridge with a PIN), macOS asks once for your Mac password the
+   first time the new version reads it. Type it and press **Always Allow**. If you press Deny,
+   VectorCable asks for the bridge PIN again.
+
 ## Remove
+
+From the bridge:
 
 ```
 curl -fsSL http://10.42.0.1/downloads/install-mac.sh | sh -s -- --uninstall
+```
+
+Or from GitHub:
+
+```
+curl -fsSL https://github.com/eusef/vector-cable/releases/latest/download/install-mac.sh | VECTORCABLE_BASE=https://github.com/eusef/vector-cable/releases/latest/download sh -s -- --uninstall
 ```
 
 ## Next

@@ -37,6 +37,100 @@ pub trait AudioAdapter: Send {
     fn read_tx(&mut self, now: LocalTime, out: &mut [i16]) -> usize;
     /// Writes rendered RX audio (what the radio heard) to the RX device.
     fn write_rx(&mut self, samples: &[i16]);
+    /// Whether this adapter has a radio monitor (RX audio also played on the
+    /// system's default output).
+    fn monitor_supported(&self) -> bool {
+        false
+    }
+    /// Asks for the radio monitor on or off and returns at once: opening an
+    /// output can take a second or more (Bluetooth), and the RX loop must
+    /// never wait on it. The outcome comes from [`AudioAdapter::monitor_event`].
+    /// A repeat `on` re-picks the current default output. See [`MonitorWorker`].
+    fn set_monitor(&mut self, _on: bool) {}
+    /// What became of a `set_monitor` request, once known; polled every tick.
+    fn monitor_event(&mut self) -> Option<MonitorEvent> {
+        None
+    }
+}
+
+/// The outcome of a radio monitor request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MonitorEvent {
+    /// Playing on this output (its display name).
+    On(String),
+    Off,
+    /// Could not turn on, and why; the monitor is off.
+    Refused(String),
+}
+
+/// Why `id` (a device's name or UID, or a sink's name or properties) must not
+/// carry the monitor, or None. Any VectorBridge device is refused: the TX
+/// cable as the output would send radio audio back to the transmitter.
+pub fn monitor_output_refused(id: &str) -> Option<String> {
+    id.to_ascii_lowercase().contains("vectorbridge").then(|| {
+        format!("{id} is a VectorBridge device; choose speakers or headphones as the sound output")
+    })
+}
+
+/// Runs an adapter's slow monitor work (opening and closing outputs) on its
+/// own thread, so the RX loop never waits on it. Requests queue; when several
+/// are waiting only the newest runs. `apply(on)` does the work and says what
+/// came of it. When the worker is dropped, `apply(false)` runs once more, so
+/// whatever is open gets closed; the drop waits for that.
+pub struct MonitorWorker {
+    requests: Option<std::sync::mpsc::Sender<bool>>,
+    events: std::sync::mpsc::Receiver<MonitorEvent>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl MonitorWorker {
+    pub fn spawn<F>(mut apply: F) -> std::io::Result<MonitorWorker>
+    where
+        F: FnMut(bool) -> MonitorEvent + Send + 'static,
+    {
+        let (requests, wanted) = std::sync::mpsc::channel::<bool>();
+        let (done, events) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("vectorcable-monitor".into())
+            .spawn(move || {
+                while let Ok(mut on) = wanted.recv() {
+                    while let Ok(newer) = wanted.try_recv() {
+                        on = newer;
+                    }
+                    if done.send(apply(on)).is_err() {
+                        break;
+                    }
+                }
+                apply(false);
+            })?;
+        Ok(MonitorWorker {
+            requests: Some(requests),
+            events,
+            thread: Some(thread),
+        })
+    }
+
+    /// Queues a request; never blocks.
+    pub fn request(&self, on: bool) {
+        if let Some(r) = &self.requests {
+            let _ = r.send(on);
+        }
+    }
+
+    /// The next finished request's outcome, if any; never blocks.
+    pub fn event(&self) -> Option<MonitorEvent> {
+        self.events.try_recv().ok()
+    }
+}
+
+impl Drop for MonitorWorker {
+    fn drop(&mut self) {
+        // Closing the request channel ends the thread's loop.
+        self.requests = None;
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 /// No devices. A simulated device clock (nominal 48 kHz plus `device_ppm`)
@@ -273,5 +367,81 @@ mod tests {
         assert_eq!(peak_dbfs(&[0, 0]), None);
         assert!((peak_dbfs(&[i16::MAX]).unwrap()).abs() < 1e-9);
         assert!((peak_dbfs(&[0, -3277]).unwrap() + 20.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn monitor_refuses_vectorbridge_outputs_only() {
+        for id in [
+            "vectorbridge_tx",
+            "VectorBridgeTX_UID",
+            "VectorBridge TX",
+            "vectorbridge_rx_sink",
+        ] {
+            assert!(monitor_output_refused(id).is_some(), "{id}");
+        }
+        for id in [
+            "alsa_output.pci-0000_00_1b.0.analog-stereo",
+            "BuiltInSpeakerDevice",
+            "MacBook Pro Speakers",
+        ] {
+            assert_eq!(monitor_output_refused(id), None, "{id}");
+        }
+    }
+
+    #[test]
+    fn null_adapter_has_no_monitor() {
+        let mut a = NullAdapter::new();
+        assert!(!a.monitor_supported());
+        a.set_monitor(true);
+        assert_eq!(a.monitor_event(), None);
+    }
+
+    /// Slow work runs off the caller's thread, only the newest of several
+    /// waiting requests runs, and dropping the worker turns the monitor off.
+    #[test]
+    fn monitor_worker_never_blocks_runs_the_newest_and_closes_on_drop() {
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let w = MonitorWorker::spawn(move |on| {
+            seen.lock().unwrap().push(on);
+            std::thread::sleep(Duration::from_millis(200));
+            if on {
+                MonitorEvent::On("Speakers".into())
+            } else {
+                MonitorEvent::Off
+            }
+        })
+        .unwrap();
+        let start = Instant::now();
+        w.request(true);
+        assert!(
+            start.elapsed() < Duration::from_millis(20),
+            "request blocked"
+        );
+        // Once the first is running, queue two more behind it.
+        while calls.lock().unwrap().is_empty() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        w.request(false);
+        w.request(true);
+        assert_eq!(w.event(), None, "nothing finished yet");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut events = Vec::new();
+        while events.len() < 2 && Instant::now() < deadline {
+            events.extend(w.event());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The first request was already running; of the two waiting, the newest ran.
+        assert_eq!(
+            events,
+            [
+                MonitorEvent::On("Speakers".into()),
+                MonitorEvent::On("Speakers".into())
+            ]
+        );
+        drop(w);
+        assert_eq!(*calls.lock().unwrap(), [true, true, false]);
     }
 }

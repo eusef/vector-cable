@@ -20,11 +20,11 @@ installs anything.
 
 ## Install on macOS
 
-**Quick install from GitHub**, in Terminal:
+**Quick install from GitHub**: open Terminal (Applications, Utilities), press the copy button on
+this line, paste it and press Return:
 
 ```sh
-B=https://github.com/eusef/vector-cable/releases/latest/download
-curl -fsSL $B/install-mac.sh | VECTORCABLE_BASE=$B sh
+curl -fsSL https://github.com/eusef/vector-cable/releases/latest/download/install-mac.sh | VECTORCABLE_BASE=https://github.com/eusef/vector-cable/releases/latest/download sh
 ```
 
 **From the bridge**, on its Wi-Fi (on home Wi-Fi, use the bridge's address instead of
@@ -44,10 +44,19 @@ VectorBridge RX and VectorBridge TX are ready."
 package is not notarized, so macOS blocks the first open: go to System Settings, Privacy and
 Security, press **Open Anyway**, and open it again.
 
+**Upgrade:** quit VectorCable and your radio apps, then run the quick-install line again. It
+fetches the newest release, checks the download and installs it over the old one, asking for your
+Mac password and pausing audio for a few seconds as at install; your settings and the bridge
+log-in are kept. It shows "Installed.", and `vectorcable version` shows the new version. If you
+saved a bridge log-in (a bridge with a PIN), macOS asks once more for your Mac password the first
+time the new version reads it: type it and press **Always Allow** (Deny means typing the bridge
+PIN again). The line from the bridge installs the version that bridge carries, which can be older
+than GitHub's.
+
 **Remove:** the quick-install line with `-s -- --uninstall` after `sh`:
 
 ```sh
-curl -fsSL $B/install-mac.sh | VECTORCABLE_BASE=$B sh -s -- --uninstall
+curl -fsSL https://github.com/eusef/vector-cable/releases/latest/download/install-mac.sh | VECTORCABLE_BASE=https://github.com/eusef/vector-cable/releases/latest/download sh -s -- --uninstall
 ```
 
 ## Install on Linux
@@ -61,11 +70,11 @@ sudo dnf install pulseaudio-utils     # Fedora
 sudo pacman -S libpulse               # Arch
 ```
 
-**Quick install from GitHub**, as your own user (no `sudo`):
+**Quick install from GitHub**: open a terminal, press the copy button on this line, paste it and
+press Enter, as your own user (no `sudo`):
 
 ```sh
-B=https://github.com/eusef/vector-cable/releases/latest/download
-curl -fsSL $B/install-linux.sh | VECTORCABLE_BASE=$B sh
+curl -fsSL https://github.com/eusef/vector-cable/releases/latest/download/install-linux.sh | VECTORCABLE_BASE=https://github.com/eusef/vector-cable/releases/latest/download sh
 ```
 
 **From the bridge**, on its Wi-Fi:
@@ -89,16 +98,23 @@ install -D -m 755 vectorcable-*-linux-*/vectorcable ~/.local/bin/vectorcable
 install -D -m 644 vectorcable-*-linux-*/vectorcable.desktop ~/.local/share/applications/vectorcable.desktop
 ```
 
+**Upgrade:** quit VectorCable and your radio apps, then run the quick-install line again. It
+fetches the newest release, checks the download and replaces the old program; your settings and
+the bridge log-in are kept. It shows "Installed vectorcable" and the new version. The line from
+the bridge installs the version that bridge carries, which can be older than GitHub's.
+
 **Remove:**
 
 ```sh
-curl -fsSL $B/install-linux.sh | VECTORCABLE_BASE=$B sh -s -- --uninstall
+curl -fsSL https://github.com/eusef/vector-cable/releases/latest/download/install-linux.sh | VECTORCABLE_BASE=https://github.com/eusef/vector-cable/releases/latest/download sh -s -- --uninstall
 ```
 
-Settings in `~/.config/vectorcable` are kept; delete that folder to remove them too.
+Settings in `~/.config/vectorcable` are kept; delete that folder to remove them too. The bridge
+log-in in `~/.local/state/vectorcable` is kept as well; delete that folder to forget it.
 
-On Linux the bridge PIN is asked for on every start: VectorCable does not yet keep the app token
-between runs there, as it does in the macOS Keychain.
+On Linux VectorCable keeps the bridge's app token (never the PIN) in
+`~/.local/state/vectorcable/tokens`, readable only by you, so the PIN is typed once per bridge,
+as with the macOS Keychain. If that file cannot be written, the PIN is asked for on each start.
 
 **From source** instead: with Rust installed ([rustup.rs](https://rustup.rs)), run
 `cargo install --locked --path crates/vectorcable` in a clone of this repo; it installs to

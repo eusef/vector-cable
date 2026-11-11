@@ -49,6 +49,12 @@ const FIRST_LINE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longer than any rigctl command line.
 const MAX_FIRST_LINE: usize = 1024;
 const POLL: Duration = Duration::from_millis(50);
+/// The Listen Only keying warning comes at most this often: an app keys
+/// whole slots, so once a key would repeat every 15 s.
+const KEY_WARNING_EVERY: Duration = Duration::from_secs(30);
+/// What the relay says when an app keys the radio while VectorCable is
+/// Listen Only. The key still goes to the bridge.
+pub const KEYED_IN_LISTEN_ONLY: &str = "Rig control: an app keyed the radio while VectorCable is Listen Only, so the radio is sending no audio; press t for TX mode, or stop the app transmitting.";
 /// A silent rigctld (just starting, or the radio just switched on) gets one
 /// more try after each wait; short, as the app is waiting on its first answer.
 const SILENT_RETRIES: [Duration; 2] = [Duration::from_millis(500), Duration::from_secs(1)];
@@ -78,6 +84,9 @@ pub struct Upstream {
     /// The bridge says it takes `\vb_auth`, so a refusal with no token held
     /// means the user has not typed the PIN yet.
     pub vb_auth: bool,
+    /// VectorCable is Listen Only (sends no TX audio): an app's key is still
+    /// carried, with a warning.
+    pub listen_only: bool,
 }
 
 impl std::fmt::Debug for Upstream {
@@ -86,6 +95,7 @@ impl std::fmt::Debug for Upstream {
             .field("addr", &self.addr)
             .field("token", &self.token.as_ref().map(|_| "<set>"))
             .field("vb_auth", &self.vb_auth)
+            .field("listen_only", &self.listen_only)
             .finish()
     }
 }
@@ -145,6 +155,8 @@ fn sendable(token: &str) -> bool {
 struct Notes {
     sender: Sender<String>,
     last: Mutex<Option<String>>,
+    /// When the Listen Only keying warning last went out.
+    keyed: Mutex<Option<Instant>>,
 }
 
 impl Notes {
@@ -154,6 +166,17 @@ impl Notes {
             let _ = self.sender.send(text.clone());
             *last = Some(text);
         }
+    }
+
+    /// Warns that an app keyed the radio while VectorCable is Listen Only, at
+    /// most every [`KEY_WARNING_EVERY`].
+    fn keyed_in_listen_only(&self) {
+        let mut last = self.keyed.lock().unwrap();
+        if last.is_some_and(|t| t.elapsed() < KEY_WARNING_EVERY) {
+            return;
+        }
+        *last = Some(Instant::now());
+        let _ = self.sender.send(KEYED_IN_LISTEN_ONLY.into());
     }
 }
 
@@ -192,6 +215,7 @@ pub fn spawn(
             let notes = Arc::new(Notes {
                 sender: notes,
                 last: Mutex::new(None),
+                keyed: Mutex::new(None),
             });
             let open: Open = Arc::default();
             let active = Arc::new(AtomicUsize::new(0));
@@ -265,7 +289,7 @@ fn read_line(stream: &mut TcpStream, max: usize) -> Option<Vec<u8>> {
 struct Link<'a> {
     source: &'a Source,
     refused: &'a Refused,
-    notes: &'a Notes,
+    notes: &'a Arc<Notes>,
     stop: &'a AtomicBool,
 }
 
@@ -296,6 +320,18 @@ fn serve(id: u64, mut client: TcpStream, link: &Link, open: &Open) {
     let Some(mut bridge) = bridge else {
         return;
     };
+    // A key is carried as it is; in Listen Only it is also warned about.
+    let warn_key: Arc<dyn Fn() + Send + Sync> = {
+        let (source, notes) = (link.source.clone(), link.notes.clone());
+        Arc::new(move || {
+            if source().listen_only {
+                notes.keyed_in_listen_only();
+            }
+        })
+    };
+    if keys_ptt(&first) {
+        warn_key();
+    }
     let mut first = first;
     first.push(b'\n');
     if bridge.write_all(&first).is_err() {
@@ -332,7 +368,7 @@ fn serve(id: u64, mut client: TcpStream, link: &Link, open: &Open) {
     let (up_closed, up_quit) = (closed.clone(), quit.clone());
     let up = std::thread::Builder::new()
         .name("vbcore-rigrelay-up".into())
-        .spawn(move || pipe(client, bridge_w, &up_closed, Some(&up_quit)));
+        .spawn(move || pipe(client, bridge_w, &up_closed, Some((&up_quit, &*warn_key))));
     let bridge_closed_first = pipe(bridge, client_w, &closed, None);
     // The app closing is routine, and so is the bridge closing after the app's
     // quit; the bridge closing otherwise cuts the app's rig control, which
@@ -442,10 +478,10 @@ fn pipe(
     mut from: TcpStream,
     mut to: TcpStream,
     closed: &AtomicBool,
-    quit: Option<&AtomicBool>,
+    app_side: Option<(&AtomicBool, &(dyn Fn() + Send + Sync))>,
 ) -> bool {
-    match quit {
-        Some(q) => copy_noting_quit(&mut from, &mut to, q),
+    match app_side {
+        Some((quit, keyed)) => copy_noting_quit(&mut from, &mut to, quit, keyed),
         None => {
             let _ = io::copy(&mut from, &mut to);
         }
@@ -462,9 +498,31 @@ fn is_quit(line: &[u8]) -> bool {
     matches!(String::from_utf8_lossy(line).trim(), "q" | "Q" | "\\quit")
 }
 
+/// A rigctld command that keys the transmitter: `T` or `\set_ptt` with a PTT
+/// value other than 0 (1 on, 2 mic, 3 data), in any of Hamlib's forms: an
+/// extended-response prefix (`+`, `;`, `|`, `,`) and a VFO before the value.
+pub fn keys_ptt(line: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(line);
+    let text = text.trim();
+    let text = text.strip_prefix(['+', ';', '|', ',']).unwrap_or(text);
+    let words: Vec<&str> = text.split_whitespace().collect();
+    matches!(words.first(), Some(&"T") | Some(&"\\set_ptt"))
+        && words.len() >= 2
+        && words
+            .last()
+            .and_then(|v| v.parse::<u8>().ok())
+            .is_some_and(|v| v != 0)
+}
+
 /// Copies the app's bytes to the bridge, setting `quit` when the last whole
-/// line was a quit. Set before the bytes go, so before the bridge's close.
-fn copy_noting_quit(from: &mut TcpStream, to: &mut TcpStream, quit: &AtomicBool) {
+/// line was a quit (set before the bytes go, so before the bridge's close),
+/// and calling `keyed` for a line that keys the transmitter.
+fn copy_noting_quit(
+    from: &mut TcpStream,
+    to: &mut TcpStream,
+    quit: &AtomicBool,
+    keyed: &(dyn Fn() + Send + Sync),
+) {
     let mut buf = [0u8; 4096];
     let mut line = Vec::new();
     loop {
@@ -475,6 +533,9 @@ fn copy_noting_quit(from: &mut TcpStream, to: &mut TcpStream, quit: &AtomicBool)
         for &b in &buf[..n] {
             if b == b'\n' {
                 quit.store(is_quit(&line), Ordering::SeqCst);
+                if keys_ptt(&line) {
+                    keyed();
+                }
                 line.clear();
             } else if line.len() < 64 {
                 line.push(b);
@@ -573,12 +634,22 @@ mod tests {
     }
 
     fn relay_to(rig: SocketAddr, token: Option<&str>, vb_auth: bool) -> Running {
+        relay_with(rig, token, vb_auth, false)
+    }
+
+    fn relay_with(
+        rig: SocketAddr,
+        token: Option<&str>,
+        vb_auth: bool,
+        listen_only: bool,
+    ) -> Running {
         let listener = bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = listener.local_addr().unwrap();
         let upstream = Upstream {
             addr: rig,
             token: token.map(String::from),
             vb_auth,
+            listen_only,
         };
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -616,6 +687,86 @@ mod tests {
 
     fn note(r: &Running) -> String {
         r.notes.recv_timeout(Duration::from_secs(3)).unwrap()
+    }
+
+    #[test]
+    fn a_ptt_key_is_told_apart_in_every_hamlib_form() {
+        for keys in [
+            "T 1",
+            "T 2",
+            "T 3",
+            "\\set_ptt 1",
+            "+\\set_ptt 1",
+            ";T 1",
+            "T VFOA 1",
+            "\\set_ptt currVFO 3",
+            " T 1\r",
+        ] {
+            assert!(keys_ptt(keys.as_bytes()), "{keys:?}");
+        }
+        for not in [
+            "T 0",
+            "\\set_ptt 0",
+            "T VFOA 0",
+            "t",
+            "\\get_ptt",
+            "T",
+            "F 14074000",
+            "TX 1",
+            "q",
+        ] {
+            assert!(!keys_ptt(not.as_bytes()), "{not:?}");
+        }
+    }
+
+    /// The notes the relay sends within `wait`.
+    fn notes_within(r: &Running, wait: Duration) -> Vec<String> {
+        let end = Instant::now() + wait;
+        let mut got = Vec::new();
+        while let Some(left) = end.checked_duration_since(Instant::now()) {
+            match r.notes.recv_timeout(left) {
+                Ok(n) => got.push(n),
+                Err(_) => break,
+            }
+        }
+        got
+    }
+
+    /// In Listen Only an app's key still reaches the bridge, with one
+    /// warning however often it keys; in TX mode there is no warning.
+    #[test]
+    fn a_key_in_listen_only_is_carried_with_a_warning() {
+        let rig = FakeRig::start(None, false);
+        let r = relay_with(rig.addr, None, false, true);
+        let mut app = TcpStream::connect(r.addr).unwrap();
+        // The first line, and keys later on the same connection.
+        app.write_all(b"T 1\nT 0\n\\set_ptt VFOA 1\nT 0\n").unwrap();
+        let notes = notes_within(&r, Duration::from_millis(800));
+        assert_eq!(
+            notes.iter().filter(|n| *n == KEYED_IN_LISTEN_ONLY).count(),
+            1,
+            "{notes:?}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while rig.lines().len() < 4 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(rig.lines(), ["T 1", "T 0", "\\set_ptt VFOA 1", "T 0"]);
+
+        let rig = FakeRig::start(None, false);
+        let r = relay_with(rig.addr, None, false, false);
+        let mut app = TcpStream::connect(r.addr).unwrap();
+        app.write_all(b"T 1\nT 0\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let notes = notes_within(&r, Duration::from_millis(800));
+        assert!(
+            !notes.iter().any(|n| n == KEYED_IN_LISTEN_ONLY),
+            "{notes:?}"
+        );
+        while rig.lines().len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(rig.lines(), ["T 1", "T 0"]);
     }
 
     #[test]

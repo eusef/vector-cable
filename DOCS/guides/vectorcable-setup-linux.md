@@ -36,8 +36,7 @@ checks it against the bridge's manifest before installing.
 With internet instead of the bridge, the same installer runs from GitHub:
 
 ```
-B=https://github.com/eusef/vector-cable/releases/latest/download
-curl -fsSL $B/install-linux.sh | VECTORCABLE_BASE=$B sh
+curl -fsSL https://github.com/eusef/vector-cable/releases/latest/download/install-linux.sh | VECTORCABLE_BASE=https://github.com/eusef/vector-cable/releases/latest/download sh
 ```
 
 Prefer a download? The Downloads page has `vectorcable-<version>-linux-x86_64.tar.gz` and
@@ -48,8 +47,10 @@ Prefer a download? The Downloads page has `vectorcable-<version>-linux-x86_64.ta
 1. Open **VectorCable** from the applications menu (or run `vectorcable` in a terminal). A
    terminal window opens showing the Status tab. While it runs, **VectorBridge RX** and
    **VectorBridge TX** appear in your sound settings; they go away when you quit.
-2. If the bridge has an admin PIN, Status says "press p". Press p and type the PIN. On Linux
-   VectorCable asks for it each time it starts.
+2. If the bridge has an admin PIN, Status says "press p". Press p and type the PIN. VectorCable
+   keeps a token for that bridge (never the PIN) in `~/.local/state/vectorcable/tokens` (under
+   `$XDG_STATE_HOME` if you set it), readable only by you, so later starts need no PIN. A backup
+   of your home folder copies it; if one goes astray, revoke VectorCable's token on the bridge.
 3. Status shows the bridge, the link and the audio buffer. The first run starts in
    **Listen Only**; press the key the screen names to switch to Transmit once the bridge
    shows the radio is ready.
@@ -63,13 +64,38 @@ Start VectorCable before the radio app, so the app finds the two devices when it
 `vectorcable doctor` checks that PipeWire can make the two devices and that the bridge answers,
 and prints a fix for each row that is not Good.
 
+## Listen to the radio
+
+Press `m` to hear the radio on the desktop's sound output (speakers or headphones) while the apps
+decode; press `m` again to stop. It uses the output chosen in Sound settings when you press it,
+and the system volume sets the level. Status shows it on the Monitor row. It is off each time
+VectorCable starts, and the apps' audio is the same either way.
+
+## Upgrade
+
+1. Quit VectorCable and your radio apps.
+2. Run the install line again, from the bridge or from GitHub, without `sudo`. It checks the
+   download and replaces the old program; your settings and the bridge log-in are kept. The
+   bridge line installs the version that bridge carries; the GitHub line installs the newest
+   release.
+3. The installer shows "Installed vectorcable" and the version you now have.
+
 ## Remove
+
+From the bridge:
 
 ```
 curl -fsSL http://10.42.0.1/downloads/install-linux.sh | sh -s -- --uninstall
 ```
 
-Settings in `~/.config/vectorcable` are kept; delete that folder to remove them too.
+Or from GitHub:
+
+```
+curl -fsSL https://github.com/eusef/vector-cable/releases/latest/download/install-linux.sh | VECTORCABLE_BASE=https://github.com/eusef/vector-cable/releases/latest/download sh -s -- --uninstall
+```
+
+Settings in `~/.config/vectorcable` are kept; delete that folder to remove them too. The bridge
+log-in in `~/.local/state/vectorcable` is kept as well; delete that folder to forget it.
 
 ## Next
 

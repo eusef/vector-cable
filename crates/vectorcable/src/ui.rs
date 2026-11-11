@@ -145,6 +145,8 @@ pub struct Card {
     pub verdict: Verdict,
     /// One plain-words sentence under the verdict, at most [`CARD_SENTENCE_MAX`].
     pub detail: String,
+    /// The same sentence's second row, for one that cannot fit on one.
+    pub more: Option<String>,
     /// What to do, when the verdict is Not Ready for a fault ("Fix: " is added).
     pub fix: Option<String>,
 }
@@ -206,14 +208,32 @@ pub fn receive_card(s: &Snapshot) -> Card {
         title: "Receive",
         verdict,
         detail,
+        more: None,
         fix,
     }
 }
 
+/// The radio control (CAT) relay on 127.0.0.1:4532 can key the radio for
+/// apps only once the bridge PIN is in, when the bridge says 4532 needs a login.
+fn ptt_waits_for_pin(s: &Snapshot) -> bool {
+    use vbcore::runner::ListingState as L;
+    let login_required = matches!(
+        &s.rigctl,
+        Some(RigctlState::Proxy {
+            login_required: true,
+            ..
+        })
+    );
+    let pin_missing = matches!(&s.listing, Some(L::PinNeeded | L::BadPin | L::Locked(_)));
+    login_required && pin_missing
+}
+
 /// Transmit readiness: the slot, the link and the bridge's transmit checks.
 /// Ready only once the radio control (CAT) check is known to pass, or the
-/// rig is VOX; unknown or pending is Not Ready with a warning.
+/// rig is VOX; unknown or pending is Not Ready with a warning. A CAT rig
+/// whose 4532 needs a login is Not Ready until the bridge PIN is in.
 pub fn transmit_card(s: &Snapshot) -> Card {
+    let mut more = None;
     let cap_tripped = s
         .status
         .as_ref()
@@ -265,6 +285,17 @@ pub fn transmit_card(s: &Snapshot) -> Card {
             Some(LadderState::Cat {
                 tx_allowed: Some(true),
                 ..
+            }) if ptt_waits_for_pin(s) => {
+                more = Some("radio (PTT) until the PIN is entered".to_string());
+                (
+                    Verdict::NotReadyPending,
+                    "Apps on this device can't key the".to_string(),
+                    None,
+                )
+            }
+            Some(LadderState::Cat {
+                tx_allowed: Some(true),
+                ..
             }) => (
                 Verdict::Ready,
                 "Audio from the app goes to air".to_string(),
@@ -288,6 +319,7 @@ pub fn transmit_card(s: &Snapshot) -> Card {
         title: "Transmit",
         verdict,
         detail,
+        more,
         fix,
     }
 }
@@ -534,6 +566,126 @@ pub fn checks(s: &Snapshot, rigctl_port_open: Option<bool>) -> Vec<CheckLine> {
     out
 }
 
+/// The Check tab's "Bridge PIN" line, once the listing has answered.
+/// `bridge_name` is the name the bridge was found by, if it was a name.
+pub fn pin_check(s: &Snapshot, bridge_name: Option<&str>) -> Option<CheckLine> {
+    let pin = pin_status(s)?;
+    let detail = if pin.glyph == Glyph::Ok {
+        format!(
+            "{}; VectorCable keeps the bridge's login in {}, never the PIN",
+            pin.label,
+            login_store()
+        )
+    } else {
+        format!(
+            "{}{}. {}",
+            pin.label,
+            pin.press_p(),
+            pin_hint(s, bridge_name)
+        )
+    };
+    Some(CheckLine {
+        name: "Bridge PIN",
+        glyph: pin.glyph,
+        word: pin.word,
+        detail,
+    })
+}
+
+/// The bridge's admin PIN as VectorCable last found it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinStatus {
+    pub glyph: Glyph,
+    pub word: &'static str,
+    pub label: String,
+    /// Typing the PIN (`p`) fixes it.
+    pub wants_pin: bool,
+}
+
+impl PinStatus {
+    fn press_p(&self) -> &'static str {
+        if self.wants_pin {
+            ", press p to enter it"
+        } else {
+            ""
+        }
+    }
+}
+
+/// The PIN state, from the last app-listing POST (the one POST VectorCable
+/// makes by itself); `None` until that POST has answered.
+pub fn pin_status(s: &Snapshot) -> Option<PinStatus> {
+    use vbcore::runner::ListingState as L;
+    let listing = s.listing.as_ref()?;
+    let (glyph, word, label) = match listing {
+        L::Listed | L::Stored => (Glyph::Ok, "Good", "logged in".to_string()),
+        L::PinNeeded => (Glyph::Check, "Check", "not entered".to_string()),
+        L::BadPin => (Glyph::Fix, "Fix", "wrong PIN".to_string()),
+        L::Locked(secs) => (
+            Glyph::Fix,
+            "Fix",
+            format!("locked after wrong PINs, retry in {secs} s"),
+        ),
+        L::PinUnset => (
+            Glyph::Check,
+            "Check",
+            "not set on the bridge yet".to_string(),
+        ),
+        L::WifiOpen => (
+            Glyph::Check,
+            "Check",
+            "not usable until the bridge Wi-Fi has a passphrase".to_string(),
+        ),
+        L::NotSupported => (
+            Glyph::Check,
+            "Check",
+            "not known (this bridge has no app listing)".to_string(),
+        ),
+        L::Failed(e) => (Glyph::Check, "Check", format!("not known: {e}")),
+    };
+    Some(PinStatus {
+        glyph,
+        word,
+        label,
+        wants_pin: listing.wants_pin(),
+    })
+}
+
+/// Where the PIN lives and how to set or reset it (vector-bridge
+/// DOCS/web-api.md and DOCS/field-network.md, "Admin PIN"). The web page is
+/// named by `bridge_name` (what the bridge was found by, such as
+/// `vectorbridge.local`) when there is one, else by its current address.
+pub fn pin_hint(s: &Snapshot, bridge_name: Option<&str>) -> String {
+    let host = match (bridge_name, s.bridge.ip()) {
+        (Some(name), _) => name.to_string(),
+        (None, IpAddr::V6(v6)) => format!("[{v6}]"),
+        (None, v4) => v4.to_string(),
+    };
+    if s.listing == Some(vbcore::runner::ListingState::WifiOpen) {
+        // An open access point takes no PIN until its Wi-Fi has a passphrase.
+        return format!(
+            "Give the bridge Wi-Fi a passphrase on the bridge's web page, http://{host}/, \
+             then set the PIN there."
+        );
+    }
+    format!(
+        "It is the bridge's admin PIN, kept on the bridge: set or change it on the \
+         bridge's web page, http://{host}/ (Wi-Fi sheet). Forgot it? Reset it at the \
+         bridge's HDMI console, then set a new one on the web page."
+    )
+}
+
+/// Where this build keeps the bridge's app token (`app::token_store`).
+fn login_store() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "the Keychain"
+    } else if cfg!(target_os = "linux") {
+        "an owner-only token file"
+    } else {
+        "memory until it quits"
+    }
+}
+
 /// Which app the Setup tab shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum App {
@@ -664,6 +816,11 @@ pub struct View {
     pub help: bool,
     /// Digits typed so far while the bridge PIN is being entered (never the digits).
     pub pin_entry: Option<usize>,
+    /// Why the PIN is asked for, e.g. "to change the levels": the band shows
+    /// while this is set, even before `p` starts the entry.
+    pub pin_reason: Option<String>,
+    /// The name the bridge was found by (not an address), for the PIN hint.
+    pub bridge_name: Option<String>,
 }
 
 const CARD_HEIGHT: u16 = 5;
@@ -676,7 +833,8 @@ pub fn draw(frame: &mut Frame, view: &View) {
         .constraints([
             Constraint::Length(1),
             Constraint::Min(8),
-            Constraint::Length(3),
+            // The PIN entry takes two more rows, for where the PIN is set.
+            Constraint::Length(if pin_band(view) { 5 } else { 3 }),
             Constraint::Length(1),
         ])
         .split(area);
@@ -780,6 +938,9 @@ fn draw_card(frame: &mut Frame, area: Rect, view: &View, card: &Card) {
         )),
         Line::from(Span::styled(card.detail.clone(), view.theme.text())),
     ];
+    if let Some(more) = &card.more {
+        lines.push(Line::from(Span::styled(more.clone(), view.theme.text())));
+    }
     if let Some(fix) = &card.fix {
         lines.push(Line::from(Span::styled(
             format!("Fix: {fix}"),
@@ -906,6 +1067,11 @@ fn draw_link_panel(frame: &mut Frame, area: Rect, view: &View) {
         ),
         pair("Mode", s.mode.word().to_string(), t.text()),
         pair(
+            "Monitor",
+            s.monitor.clone().unwrap_or_else(|| "off (m)".into()),
+            t.text(),
+        ),
+        pair(
             "Apps row",
             dash(s.listing.as_ref().map(|l| {
                 if l.wants_pin() {
@@ -943,7 +1109,8 @@ fn draw_link_panel(frame: &mut Frame, area: Rect, view: &View) {
         ),
         pair("Clock", clock_value, clock_style),
     ];
-    let mut lines = pack(items, inner.width as usize, t);
+    let mut lines = vec![pin_line(view)];
+    lines.extend(pack(items, inner.width as usize, t));
     let width = (inner.width as usize).saturating_sub(13).min(40);
     lines.push(meter(view, "RX", s.rx_dbfs, width));
     lines.push(meter(view, "TX", s.tx_dbfs, width));
@@ -1161,7 +1328,11 @@ fn draw_check_tab(frame: &mut Frame, area: Rect, view: &View) {
     // under the names (test 10: readable at 80 x 24).
     let detail_width = (inner.width as usize).saturating_sub(CHECK_DETAIL_COL);
     let mut lines: Vec<Line> = Vec::new();
-    for c in checks(&view.snapshot, view.rigctl_port_open) {
+    let pin = pin_check(&view.snapshot, view.bridge_name.as_deref());
+    for c in checks(&view.snapshot, view.rigctl_port_open)
+        .into_iter()
+        .chain(pin)
+    {
         let parts = if detail_width >= 16 {
             wrap_words(&c.detail, detail_width)
         } else {
@@ -1279,6 +1450,31 @@ fn draw_levels_tab(frame: &mut Frame, area: Rect, view: &View) {
     );
 }
 
+/// The Link panel's first row: the bridge PIN, in its verdict colour, so a
+/// PIN not yet entered is the first thing under the cards.
+fn pin_line(view: &View) -> Line<'static> {
+    let t = &view.theme;
+    let value = match pin_status(&view.snapshot) {
+        Some(pin) => Span::styled(
+            format!(
+                "{} {}  {}{}",
+                pin.glyph.text(view.ascii),
+                pin.word,
+                pin.label,
+                pin.press_p()
+            ),
+            check_style(view, pin.glyph),
+        ),
+        None => Span::styled(dash::<String>(None), t.text()),
+    };
+    Line::from(vec![Span::styled("Bridge PIN ", t.secondary()), value])
+}
+
+/// The PIN band shows while the PIN is being typed or is asked for.
+fn pin_band(view: &View) -> bool {
+    view.pin_entry.is_some() || view.pin_reason.is_some()
+}
+
 fn draw_status_region(frame: &mut Frame, area: Rect, view: &View) {
     let t = &view.theme;
     if let Some(alert) = &view.alert {
@@ -1308,13 +1504,17 @@ fn draw_status_region(frame: &mut Frame, area: Rect, view: &View) {
         );
         return;
     }
-    if let Some(digits) = view.pin_entry {
+    if pin_band(view) {
         // The same band as an alert: the digits never reach the view, only a mask.
         frame.render_widget(Clear, area);
         frame.render_widget(Block::default().style(t.panel()), area);
         let title = Rect { height: 1, ..area };
+        let heading = match &view.pin_reason {
+            Some(why) => format!(" Bridge PIN needed {why}"),
+            None => " Bridge PIN".to_string(),
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(" Bridge PIN", strong(t)))).style(t.panel()),
+            Paragraph::new(Line::from(Span::styled(heading, strong(t)))).style(t.panel()),
             title,
         );
         let inner = Rect {
@@ -1323,15 +1523,32 @@ fn draw_status_region(frame: &mut Frame, area: Rect, view: &View) {
             width: area.width.saturating_sub(2),
             height: area.height.saturating_sub(1),
         };
-        let mask = if view.ascii { "*" } else { "•" }.repeat(digits);
+        let first = match view.pin_entry {
+            Some(digits) => {
+                let mask = if view.ascii { "*" } else { "•" }.repeat(digits);
+                Line::from(vec![
+                    Span::styled(format!("PIN: {mask}_"), t.text()),
+                    Span::styled(
+                        "   4 to 8 digits. Enter to log in, Esc to cancel.",
+                        t.secondary(),
+                    ),
+                ])
+            }
+            // Asked for, not yet typing: every other key keeps its job.
+            None => Line::from(Span::styled(
+                "Press p to type it, Esc to dismiss.",
+                t.text(),
+            )),
+        };
         frame.render_widget(
             Paragraph::new(vec![
-                Line::from(Span::styled(format!("PIN: {mask}_"), t.text())),
+                first,
                 Line::from(Span::styled(
-                    "4 to 8 digits. Enter to log in, Esc to cancel.",
+                    pin_hint(&view.snapshot, view.bridge_name.as_deref()),
                     t.secondary(),
                 )),
             ])
+            .wrap(Wrap { trim: false })
             .style(t.panel()),
             inner,
         );
@@ -1356,7 +1573,7 @@ fn draw_status_region(frame: &mut Frame, area: Rect, view: &View) {
 fn draw_hints(frame: &mut Frame, area: Rect, view: &View) {
     let t = &view.theme;
     let hints = if view.help {
-        " 1-4 Tab tabs  t tx  l listen  n night  w/j/f app  arrows  q quit"
+        " 1-4 Tab tabs  t tx  l listen  m monitor  n night  arrows  q quit"
     } else {
         " 1-4 tabs  t transmit  l listen  n Night Ops  ? help  q quit"
     };
@@ -1428,6 +1645,7 @@ mod tests {
             listing: None,
             audio_name: "null".into(),
             audio_fault: None,
+            monitor: None,
             slot_held_by_other: false,
             rig_relay: None,
             local_ip: None,
@@ -1473,6 +1691,8 @@ mod tests {
             rigctl_port_open: None,
             help: false,
             pin_entry: None,
+            pin_reason: None,
+            bridge_name: None,
         }
     }
 
@@ -1563,6 +1783,16 @@ mod tests {
                 Verdict::Ready,
                 Verdict::Ready,
                 Box::new(connected),
+            ),
+            (
+                "CAT, 4532 waits for the PIN",
+                Verdict::Ready,
+                Verdict::NotReadyPending,
+                Box::new(move |s| {
+                    connected(s);
+                    s.rigctl = Some(rigctl_login_required(true));
+                    s.listing = Some(vbcore::runner::ListingState::PinNeeded);
+                }),
             ),
             (
                 "VOX ready",
@@ -1694,6 +1924,68 @@ mod tests {
         }
     }
 
+    /// The Link panel names the radio monitor's output, or says how to turn it on.
+    #[test]
+    fn link_panel_shows_the_radio_monitor() {
+        let mut v = view(themes()[0]);
+        let (rows, _) = render(&v);
+        assert!(rows.join("\n").contains("Monitor off (m)"), "{rows:?}");
+        v.snapshot.monitor = Some("MacBook Pro Speakers".into());
+        let (rows, _) = render(&v);
+        assert!(
+            rows.join("\n").contains("Monitor MacBook Pro Speakers"),
+            "{rows:?}"
+        );
+    }
+
+    fn rigctl_login_required(login_required: bool) -> RigctlState {
+        RigctlState::Proxy {
+            access: None,
+            port: Some(4532),
+            listening: None,
+            vb_auth: true,
+            login_required,
+        }
+    }
+
+    /// On a CAT rig apps key the radio over 4532, which takes them only once
+    /// the bridge PIN is in when the bridge says 4532 needs a login.
+    #[test]
+    fn transmit_is_not_ready_on_a_cat_rig_until_the_bridge_pin_is_in() {
+        use vbcore::runner::ListingState as L;
+        let mut s = snapshot();
+        s.mode = Mode::Transmit;
+        s.link = Link::Connected;
+        s.ladder = Some(LadderState::Cat {
+            tx_allowed: Some(true),
+            watchdog_s: None,
+            max_tx_s: None,
+        });
+        s.rigctl = Some(rigctl_login_required(true));
+        for missing in [L::PinNeeded, L::BadPin, L::Locked(30)] {
+            s.listing = Some(missing.clone());
+            let card = transmit_card(&s);
+            assert_eq!(card.verdict, Verdict::NotReadyPending, "{missing:?}");
+            assert_eq!(
+                format!("{} {}", card.detail, card.more.as_deref().unwrap_or("")),
+                "Apps on this device can't key the radio (PTT) until the PIN is entered"
+            );
+            assert_eq!(card.fix, None);
+        }
+        // Logged in: Ready.
+        s.listing = Some(L::Listed);
+        assert_eq!(transmit_card(&s).verdict, Verdict::Ready);
+        assert_eq!(transmit_card(&s).more, None);
+        // A bridge whose 4532 takes apps without a login: Ready.
+        s.listing = Some(L::PinNeeded);
+        s.rigctl = Some(rigctl_login_required(false));
+        assert_eq!(transmit_card(&s).verdict, Verdict::Ready);
+        // A VOX rig keys on audio, no PIN needed: Ready.
+        s.rigctl = Some(rigctl_login_required(true));
+        s.ladder = Some(LadderState::VoxRig);
+        assert_eq!(transmit_card(&s).verdict, Verdict::Ready);
+    }
+
     /// Every verdict the cards can show appears as glyph plus word, and
     /// every sentence on a card fits whole on one row at 80 x 24.
     #[test]
@@ -1712,6 +2004,7 @@ mod tests {
                     let (rows, _) = render(&v);
                     for card in [&rc, &tc] {
                         let mut sentences = vec![card.verdict.text(ascii), card.detail.clone()];
+                        sentences.extend(card.more.clone());
                         if let Some(fix) = &card.fix {
                             sentences.push(format!("Fix: {fix}"));
                         }
@@ -1774,6 +2067,136 @@ mod tests {
             "{all}"
         );
         assert!(all.contains("Enter to log in, Esc to cancel."), "{all}");
+    }
+
+    /// The Link panel's first row is the bridge PIN: "not entered" in the
+    /// warning colour until it is typed, "logged in" in the good colour after.
+    /// The Check tab says where the PIN is set and how to reset it.
+    #[test]
+    fn the_bridge_pin_row_shows_not_entered_in_amber_and_the_check_tab_says_where_it_is_set() {
+        use vbcore::runner::ListingState;
+        let theme = themes()[0];
+        let mut v = view(theme);
+        let (rows, _) = render_at(&v, 80, 24);
+        assert!(
+            rows.iter().any(|r| r.contains("Bridge PIN --")),
+            "before the listing answers: {}",
+            rows.join("\n")
+        );
+        assert_eq!(pin_check(&v.snapshot, None), None);
+
+        v.snapshot.listing = Some(ListingState::PinNeeded);
+        for (w, h) in [(80, 24), (79, 24)] {
+            let (rows, buffer) = render_at(&v, w, h);
+            let y = rows
+                .iter()
+                .position(|r| {
+                    r.contains("Bridge PIN \u{25b2} Check  not entered, press p to enter it")
+                })
+                .unwrap_or_else(|| panic!("{w}x{h}:\n{}", rows.join("\n")));
+            let x = rows[y].find("not entered").unwrap();
+            let x = rows[y][..x].chars().count() as u16;
+            assert_eq!(
+                buffer[(x, y as u16)].fg,
+                theme.color(&theme::WARNING).unwrap()
+            );
+            // Both meters still fit under it.
+            for meter in ["\u{2502} RX ", "\u{2502} TX "] {
+                assert!(
+                    rows.iter().any(|r| r.contains(meter) && r.contains("dBFS")),
+                    "{w}x{h}: {}",
+                    rows.join("\n")
+                );
+            }
+        }
+        let pin = pin_check(&v.snapshot, None).unwrap();
+        assert_eq!((pin.glyph, pin.word), (Glyph::Check, "Check"));
+        assert!(
+            pin.detail.starts_with("not entered, press p"),
+            "{}",
+            pin.detail
+        );
+        assert!(
+            pin.detail.contains("web page, http://")
+                && pin.detail.contains("Wi-Fi sheet")
+                && pin.detail.contains("HDMI console"),
+            "{}",
+            pin.detail
+        );
+
+        v.snapshot.listing = Some(ListingState::Listed);
+        let (rows, buffer) = render_at(&v, 80, 24);
+        let y = rows
+            .iter()
+            .position(|r| r.contains("Bridge PIN \u{2713} Good  logged in"))
+            .unwrap_or_else(|| panic!("{}", rows.join("\n")));
+        let x = rows[y].find("logged in").unwrap();
+        let x = rows[y][..x].chars().count() as u16;
+        assert_eq!(
+            buffer[(x, y as u16)].fg,
+            theme.color(&theme::STATUS_OK).unwrap()
+        );
+        assert!(!rows[y].contains("press p"));
+        let pin = pin_check(&v.snapshot, None).unwrap();
+        assert_eq!((pin.name, pin.word), ("Bridge PIN", "Good"));
+        assert!(pin.detail.contains("never the PIN"), "{}", pin.detail);
+    }
+
+    /// An entry opened because something needs the PIN says what for, and
+    /// where the PIN is set and reset, at 80 x 24; the digits never show.
+    #[test]
+    fn a_pin_entry_with_a_reason_says_where_the_pin_is_set_and_reset() {
+        let mut v = view(themes()[0]);
+        v.snapshot.listing = Some(vbcore::runner::ListingState::PinNeeded);
+        v.pin_entry = Some(2);
+        v.pin_reason = Some("to change the levels".into());
+        let (rows, _) = render_at(&v, 80, 24);
+        let all = rows.join("\n");
+        let flat = rows.iter().map(|r| r.trim()).collect::<Vec<_>>().join(" ");
+        assert!(
+            all.contains("Bridge PIN needed to change the levels"),
+            "{all}"
+        );
+        assert!(all.contains("PIN: \u{2022}\u{2022}_"), "{all}");
+        let host = v.snapshot.bridge.ip();
+        assert!(
+            flat.contains(&format!("http://{host}/ (Wi-Fi sheet)"))
+                && flat.contains("HDMI console, then set a new one on the web page."),
+            "{all}"
+        );
+        // The rows above the band are still the Status tab.
+        assert!(all.contains("Receive"), "{all}");
+
+        // Asked for but not yet typing: no PIN line, just how to start.
+        v.pin_entry = None;
+        let (rows, _) = render_at(&v, 80, 24);
+        let all = rows.join("\n");
+        assert!(
+            all.contains("Bridge PIN needed to change the levels"),
+            "{all}"
+        );
+        assert!(all.contains("Press p to type it, Esc to dismiss."), "{all}");
+        assert!(!all.contains("PIN: "), "{all}");
+    }
+
+    /// The hint names the bridge by the name it was found by when there is
+    /// one, else by its current address; an open access point is told to get
+    /// a Wi-Fi passphrase first.
+    #[test]
+    fn the_pin_hint_uses_the_bridge_name_or_its_current_address() {
+        let mut s = view(themes()[0]).snapshot;
+        s.bridge = "192.0.2.7:5101".parse().unwrap();
+        assert!(pin_hint(&s, None).contains("http://192.0.2.7/ (Wi-Fi sheet)"));
+        assert!(pin_hint(&s, Some("vectorbridge.local"))
+            .contains("http://vectorbridge.local/ (Wi-Fi sheet)"));
+        s.bridge = "[fd00::7]:5101".parse().unwrap();
+        assert!(pin_hint(&s, None).contains("http://[fd00::7]/"));
+        s.listing = Some(vbcore::runner::ListingState::WifiOpen);
+        let hint = pin_hint(&s, None);
+        assert!(
+            hint.starts_with("Give the bridge Wi-Fi a passphrase"),
+            "{hint}"
+        );
     }
 
     /// Narrow terminals stack the cards; both cards and the whole Link panel

@@ -75,7 +75,7 @@ uninstall() {
     say "Removing VectorCable:"
     for f in "$BIN" "$LAUNCHER"; do say "  $f"; done
     rm -f "$BIN" "$LAUNCHER"
-    say "Removed. Settings in ~/.config/vectorcable are kept; delete that folder to remove them too."
+    say "Removed. Settings in ~/.config/vectorcable and the bridge log-in in ~/.local/state/vectorcable are kept; delete those folders to remove them too."
 }
 
 # Not named install: the body runs the install command.

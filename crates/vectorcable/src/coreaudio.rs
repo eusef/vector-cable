@@ -140,6 +140,136 @@ impl TxFifo {
     }
 }
 
+/// Input frames (48 kHz) the radio monitor queues before it plays, and goes
+/// back to after the queue has grown past [`MONITOR_HIGH`].
+const MONITOR_TARGET: usize = SAMPLE_RATE as usize * 80 / 1000;
+/// Above this the monitor drops its oldest audio, down to the target: the
+/// output's clock runs slow against the RX device's.
+const MONITOR_HIGH: usize = SAMPLE_RATE as usize * 120 / 1000;
+
+/// The radio monitor's side tap: mono RX audio at 48 kHz on the RX device's
+/// clock, played on the system output at that device's own rate and clock.
+/// Linear interpolation resamples (radio audio is far below either Nyquist).
+/// The two clocks drift: a queue past [`MONITOR_HIGH`] is cut back to
+/// [`MONITOR_TARGET`]; one that runs dry plays silence and waits for the
+/// target again. Either way a short gap in what you hear, never in the cable.
+#[derive(Debug)]
+pub struct MonitorFifo {
+    q: VecDeque<f32>,
+    /// Input frames per output frame: 48000 / the output's rate.
+    step: f64,
+    /// Where the next output frame falls between `q[0]` and `q[1]`.
+    pos: f64,
+    playing: bool,
+    /// Output frames filled so far, audio or silence.
+    pulled: u64,
+}
+
+impl MonitorFifo {
+    pub fn new(out_rate: f64) -> MonitorFifo {
+        MonitorFifo {
+            q: VecDeque::with_capacity(MONITOR_HIGH + MAX_CATCH_UP_FRAMES),
+            step: SAMPLE_RATE as f64 / out_rate,
+            pos: 0.0,
+            playing: false,
+            pulled: 0,
+        }
+    }
+
+    pub fn push(&mut self, samples: &[i16]) {
+        self.q.extend(samples.iter().map(|&s| to_f32(s)));
+        if self.q.len() > MONITOR_HIGH {
+            let drop = self.q.len() - MONITOR_TARGET;
+            self.q.drain(..drop);
+        }
+    }
+
+    /// Fills an interleaved output buffer, the same sample on every channel.
+    /// Returns the frames that had audio.
+    pub fn fill(&mut self, out: &mut [f32], channels: usize) -> usize {
+        let channels = channels.max(1);
+        if !self.playing && self.q.len() >= MONITOR_TARGET {
+            self.playing = true;
+        }
+        let mut had = 0;
+        for frame in out.chunks_mut(channels) {
+            if self.playing && self.q.len() < 2 {
+                self.playing = false;
+                self.pos = 0.0;
+            }
+            let s = if self.playing {
+                had += 1;
+                let s = self.q[0] + (self.q[1] - self.q[0]) * self.pos as f32;
+                self.pos += self.step;
+                while self.pos >= 1.0 {
+                    self.q.pop_front();
+                    self.pos -= 1.0;
+                    if self.q.len() < 2 {
+                        // Dry: wait for the target again, from the next sample.
+                        self.playing = false;
+                        self.pos = 0.0;
+                        break;
+                    }
+                }
+                s
+            } else {
+                0.0
+            };
+            frame.fill(s);
+        }
+        self.pulled += (out.len() / channels) as u64;
+        had
+    }
+}
+
+/// Copies the first channel of an interleaved buffer to every channel of
+/// another buffer of the same frame count (a non-interleaved device has one
+/// buffer per channel, and each must carry the monitor).
+pub fn copy_first_channel(src: &[f32], src_channels: usize, dst: &mut [f32], dst_channels: usize) {
+    let (sc, dc) = (src_channels.max(1), dst_channels.max(1));
+    for (d, s) in dst.chunks_mut(dc).zip(src.chunks(sc)) {
+        d.fill(s[0]);
+    }
+}
+
+/// One Core Audio device as the monitor's guard sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceId {
+    pub name: String,
+    pub uid: String,
+}
+
+/// Why the default output must not carry the monitor, or None. `output` is
+/// the device itself; `parts` are the devices inside it, at any depth, when
+/// it is a Multi-Output or Aggregate device. A VectorBridge device anywhere
+/// would loop RX into TX, and one that cannot be named cannot be checked.
+pub fn monitor_refused(output: &DeviceId, parts: &[DeviceId]) -> Option<String> {
+    use vbcore::audio::monitor_output_refused;
+    let named = |d: &DeviceId| !d.name.is_empty() || !d.uid.is_empty();
+    if !named(output) {
+        return Some("the sound output has no name or UID to check".into());
+    }
+    let shown = if output.name.is_empty() {
+        &output.uid
+    } else {
+        &output.name
+    };
+    if let Some(why) =
+        monitor_output_refused(&output.name).or_else(|| monitor_output_refused(&output.uid))
+    {
+        return Some(why);
+    }
+    let bridge =
+        |d: &DeviceId| monitor_output_refused(&d.name).or_else(|| monitor_output_refused(&d.uid));
+    if parts.iter().any(|d| bridge(d).is_some()) {
+        return Some(format!(
+            "{shown} includes a VectorBridge device; choose speakers or headphones as the sound output"
+        ));
+    }
+    (!parts.iter().all(named))
+        .then(|| format!("{shown} includes a device with no name or UID to check"))
+}
+
 /// Which of the four driver devices Core Audio knows by UID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Installed {
@@ -306,7 +436,7 @@ mod mac {
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
-    use vbcore::audio::AudioAdapter;
+    use vbcore::audio::{AudioAdapter, MonitorEvent, MonitorWorker};
     use vbcore::time::LocalTime;
 
     use super::*;
@@ -358,6 +488,11 @@ mod mac {
     const NOMINAL_SAMPLE_RATE: u32 = fourcc(b"nsrt");
     const STREAM_CONFIGURATION: u32 = fourcc(b"slay");
     const BUFFER_FRAME_SIZE: u32 = fourcc(b"fsiz");
+    const DEFAULT_OUTPUT_DEVICE: u32 = fourcc(b"dOut");
+    const DEVICE_UID: u32 = fourcc(b"uid ");
+    const OBJECT_NAME: u32 = fourcc(b"lnam");
+    const AGGREGATE_ACTIVE_SUBDEVICES: u32 = fourcc(b"agrp");
+    const IOPROC_STREAM_USAGE: u32 = fourcc(b"suse");
     const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
     #[link(name = "CoreAudio", kind = "framework")]
@@ -377,6 +512,14 @@ mod mac {
             size: *mut u32,
             data: *mut c_void,
         ) -> OsStatus;
+        fn AudioObjectSetPropertyData(
+            object: ObjectId,
+            address: *const PropertyAddress,
+            qualifier_size: u32,
+            qualifier: *const c_void,
+            size: u32,
+            data: *const c_void,
+        ) -> OsStatus;
         fn AudioDeviceCreateIOProcID(
             device: ObjectId,
             proc_: IoProc,
@@ -395,6 +538,12 @@ mod mac {
             s: *const c_char,
             encoding: u32,
         ) -> CfStringRef;
+        fn CFStringGetCString(
+            s: CfStringRef,
+            buffer: *mut c_char,
+            size: isize,
+            encoding: u32,
+        ) -> u8;
         fn CFRelease(cf: *const c_void);
     }
 
@@ -461,6 +610,150 @@ mod mac {
             )
         };
         (status == 0).then_some(value)
+    }
+
+    /// A CFString property (a name or UID) as a Rust string.
+    fn string_property(object: ObjectId, selector: u32) -> Option<String> {
+        let addr = address(selector, SCOPE_GLOBAL);
+        let mut cf: CfStringRef = std::ptr::null();
+        let mut size = std::mem::size_of::<CfStringRef>() as u32;
+        // SAFETY: Core Audio hands back a CFString we own (released here);
+        // the copy is NUL terminated within the buffer it was given.
+        unsafe {
+            let status = AudioObjectGetPropertyData(
+                object,
+                &addr,
+                0,
+                std::ptr::null(),
+                &mut size,
+                &mut cf as *mut CfStringRef as *mut c_void,
+            );
+            if status != 0 || cf.is_null() {
+                return None;
+            }
+            let mut buf = [0 as c_char; 1024];
+            let ok = CFStringGetCString(
+                cf,
+                buf.as_mut_ptr(),
+                buf.len() as isize,
+                CF_STRING_ENCODING_UTF8,
+            );
+            CFRelease(cf);
+            (ok != 0).then(|| {
+                std::ffi::CStr::from_ptr(buf.as_ptr())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        }
+    }
+
+    /// The devices an Aggregate or Multi-Output device is playing through now;
+    /// empty for a plain device.
+    fn sub_devices(device: ObjectId) -> Vec<ObjectId> {
+        let addr = address(AGGREGATE_ACTIVE_SUBDEVICES, SCOPE_GLOBAL);
+        let mut size: u32 = 0;
+        // SAFETY: an array of object ids read into a buffer of the size Core
+        // Audio gave, and only the ids that fit are kept.
+        unsafe {
+            if AudioObjectGetPropertyDataSize(device, &addr, 0, std::ptr::null(), &mut size) != 0 {
+                return Vec::new();
+            }
+            let mut ids = vec![UNKNOWN_OBJECT; size as usize / std::mem::size_of::<ObjectId>()];
+            let mut size = (ids.len() * std::mem::size_of::<ObjectId>()) as u32;
+            if ids.is_empty()
+                || AudioObjectGetPropertyData(
+                    device,
+                    &addr,
+                    0,
+                    std::ptr::null(),
+                    &mut size,
+                    ids.as_mut_ptr() as *mut c_void,
+                ) != 0
+            {
+                return Vec::new();
+            }
+            ids.truncate(size as usize / std::mem::size_of::<ObjectId>());
+            ids
+        }
+    }
+
+    fn device_id(device: ObjectId) -> DeviceId {
+        DeviceId {
+            name: string_property(device, OBJECT_NAME).unwrap_or_default(),
+            uid: string_property(device, DEVICE_UID).unwrap_or_default(),
+        }
+    }
+
+    /// Every device inside `device`, at any depth (an aggregate can hold one).
+    fn parts_of(device: ObjectId) -> Vec<DeviceId> {
+        let (mut parts, mut seen, mut todo) = (Vec::new(), vec![device], vec![(device, 0)]);
+        while let Some((d, depth)) = todo.pop() {
+            // Deeper than this is not a real setup; stop rather than loop.
+            if depth >= 4 {
+                continue;
+            }
+            for sub in sub_devices(d) {
+                if !seen.contains(&sub) {
+                    seen.push(sub);
+                    parts.push(device_id(sub));
+                    todo.push((sub, depth + 1));
+                }
+            }
+        }
+        parts
+    }
+
+    /// The input-stream flags of `proc_`'s `AudioHardwareIOProcStreamUsage`
+    /// on `device` (a pointer, a count, a u32 per stream), first set all off
+    /// when `off`. None when the device has no input streams.
+    fn input_stream_usage(device: ObjectId, proc_: IoProc, off: bool) -> Option<Vec<u32>> {
+        let addr = address(IOPROC_STREAM_USAGE, SCOPE_INPUT);
+        let head = std::mem::size_of::<*const c_void>() + std::mem::size_of::<u32>();
+        let mut size: u32 = 0;
+        // SAFETY: the struct is read into an 8-byte aligned buffer of the size
+        // Core Audio gave; its proc field is set before the read, as the HAL
+        // requires, and only flags within that size are touched.
+        unsafe {
+            if AudioObjectGetPropertyDataSize(device, &addr, 0, std::ptr::null(), &mut size) != 0
+                || (size as usize) <= head
+            {
+                return None;
+            }
+            let mut buf = vec![0u64; (size as usize).div_ceil(8)];
+            let base = buf.as_mut_ptr() as *mut u8;
+            *(base as *mut IoProc) = proc_;
+            if AudioObjectGetPropertyData(
+                device,
+                &addr,
+                0,
+                std::ptr::null(),
+                &mut size,
+                base as *mut c_void,
+            ) != 0
+            {
+                return None;
+            }
+            let count = *(base.add(std::mem::size_of::<*const c_void>()) as *const u32) as usize;
+            let count = count.min((size as usize).saturating_sub(head) / 4);
+            let flags = base.add(head) as *mut u32;
+            if count == 0 {
+                return None;
+            }
+            if off {
+                for i in 0..count {
+                    *flags.add(i) = 0;
+                }
+                AudioObjectSetPropertyData(
+                    device,
+                    &addr,
+                    0,
+                    std::ptr::null(),
+                    size,
+                    base as *const c_void,
+                );
+            }
+            Some((0..count).map(|i| *flags.add(i)).collect())
+        }
     }
 
     /// Channels on one side of a device, summed over its streams.
@@ -534,7 +827,13 @@ mod mac {
     enum Side {
         Output(Arc<Mutex<RxFifo>>),
         Input(Arc<Mutex<TxFifo>>),
+        Monitor(Tap),
     }
+
+    /// The radio monitor's FIFO while it is on, shared by `write_rx`, the
+    /// monitor's IOProc and the worker that opens and closes it. Nothing slow
+    /// (and no allocation) happens under its lock.
+    type Tap = Arc<Mutex<Option<MonitorFifo>>>;
 
     /// What one IOProc reaches: its FIFO and a count of its callbacks.
     struct Context {
@@ -543,7 +842,8 @@ mod mac {
     }
 
     /// Only the first buffer carries audio (the driver has one interleaved
-    /// stream); any others are zeroed on output.
+    /// stream); any others are zeroed on output. The monitor's output may be
+    /// any device, so every buffer it has carries the monitor.
     unsafe extern "C" fn io_proc(
         _device: ObjectId,
         _now: *const c_void,
@@ -577,6 +877,34 @@ mod mac {
                     } else {
                         out.fill(0.0);
                     }
+                }
+            }
+            Side::Monitor(fifo) => {
+                if output.is_null() || (*output).count == 0 {
+                    return 0;
+                }
+                let first = std::ptr::addr_of_mut!((*output).buffers) as *mut AudioBuffer;
+                let b0 = &mut *first;
+                if b0.data.is_null() {
+                    return 0;
+                }
+                let ch0 = b0.channels as usize;
+                let out0 =
+                    std::slice::from_raw_parts_mut(b0.data as *mut f32, b0.bytes as usize / 4);
+                match lock(fifo).as_mut() {
+                    Some(f) => {
+                        f.fill(out0, ch0);
+                    }
+                    None => out0.fill(0.0),
+                }
+                for i in 1..(*output).count as usize {
+                    let b = &mut *first.add(i);
+                    if b.data.is_null() {
+                        continue;
+                    }
+                    let out =
+                        std::slice::from_raw_parts_mut(b.data as *mut f32, b.bytes as usize / 4);
+                    copy_first_channel(out0, ch0, out, b.channels as usize);
                 }
             }
             Side::Input(fifo) => {
@@ -621,6 +949,11 @@ mod mac {
                         "{what}: Core Audio would not attach (error {status})"
                     ));
                 };
+                // The monitor only plays: an output that is also a microphone
+                // (a headset, AirPods) must not have its input turned on.
+                if matches!(context.side, Side::Monitor(_)) {
+                    input_stream_usage(device, id, true);
+                }
                 let status = AudioDeviceStart(device, Some(id));
                 if status != 0 {
                     AudioDeviceDestroyIOProcID(device, id);
@@ -727,6 +1060,79 @@ mod mac {
         Ok((device, channels))
     }
 
+    /// The radio monitor while it is on: an IOProc on the system's default
+    /// output (as it was when the monitor was turned on). Its callbacks are
+    /// not watched by `fault`: a monitor that stops leaves the cable fine.
+    struct Monitor {
+        name: String,
+        /// Held for its Drop, which stops the IOProc.
+        _running: Running,
+    }
+
+    impl Monitor {
+        /// Slow (a Bluetooth output can take a second): only on the worker.
+        fn start(tap: &Tap) -> Result<Monitor, String> {
+            let device = property::<ObjectId>(SYSTEM_OBJECT, DEFAULT_OUTPUT_DEVICE, SCOPE_GLOBAL)
+                .filter(|&d| d != UNKNOWN_OBJECT)
+                .ok_or("there is no default sound output")?;
+            let output = device_id(device);
+            if let Some(why) = monitor_refused(&output, &parts_of(device)) {
+                return Err(why);
+            }
+            let name = if output.name.is_empty() {
+                output.uid
+            } else {
+                output.name
+            };
+            let rate: f64 = property(device, NOMINAL_SAMPLE_RATE, SCOPE_GLOBAL).unwrap_or(0.0);
+            if !rate.is_finite() || rate < 8000.0 {
+                return Err(format!("{name} reports no sample rate"));
+            }
+            if channels(device, SCOPE_OUTPUT) == 0 {
+                return Err(format!("{name} has no output channels"));
+            }
+            let fresh = MonitorFifo::new(rate);
+            let old = lock(tap).replace(fresh);
+            drop(old);
+            match Running::start(device, Side::Monitor(tap.clone()), &name) {
+                Ok(running) => Ok(Monitor {
+                    name,
+                    _running: running,
+                }),
+                Err(why) => {
+                    let old = lock(tap).take();
+                    drop(old);
+                    Err(why)
+                }
+            }
+        }
+    }
+
+    /// The monitor's worker: whatever is open closes first (stopping an
+    /// IOProc is slow too), so a repeat `on` re-picks the default output; the
+    /// last `apply(false)`, on drop, closes it for good.
+    fn spawn_monitor(tap: Tap) -> Result<MonitorWorker, String> {
+        let mut current: Option<Monitor> = None;
+        MonitorWorker::spawn(move |on| {
+            let old = lock(&tap).take();
+            drop(old);
+            // Stops the open output's IOProc, if any.
+            drop(current.take());
+            if !on {
+                return MonitorEvent::Off;
+            }
+            match Monitor::start(&tap) {
+                Ok(m) => {
+                    let name = m.name.clone();
+                    current.replace(m);
+                    MonitorEvent::On(name)
+                }
+                Err(why) => MonitorEvent::Refused(why),
+            }
+        })
+        .map_err(|e| format!("cannot start the radio monitor: {e}"))
+    }
+
     pub struct CoreAudioAdapter {
         rx: Arc<Mutex<RxFifo>>,
         tx: Arc<Mutex<TxFifo>>,
@@ -734,6 +1140,9 @@ mod mac {
         terminal: String,
         watch: Mutex<Watch>,
         mic: MicWatch,
+        tap: Tap,
+        /// Dropped before the cable devices: it closes the monitor and waits.
+        monitor: MonitorWorker,
         // Dropped last: stop the devices before the FIFOs go.
         rx_proc: Running,
         tx_proc: Running,
@@ -751,6 +1160,7 @@ mod mac {
             let rx_proc = Running::start(rx_dev, Side::Output(rx.clone()), "VectorBridge RX")?;
             let tx_proc = Running::start(tx_dev, Side::Input(tx.clone()), "VectorBridge TX")?;
             let now = Instant::now();
+            let tap: Tap = Arc::new(Mutex::new(None));
             Ok(CoreAudioAdapter {
                 rx,
                 tx,
@@ -761,6 +1171,8 @@ mod mac {
                     tx: (0, now),
                 }),
                 mic: MicWatch::start(mic_now())?,
+                monitor: spawn_monitor(tap.clone())?,
+                tap,
                 rx_proc,
                 tx_proc,
             })
@@ -808,6 +1220,22 @@ mod mac {
 
         fn write_rx(&mut self, samples: &[i16]) {
             lock(&self.rx).push(samples);
+            if let Some(f) = lock(&self.tap).as_mut() {
+                f.push(samples);
+            }
+        }
+
+        fn monitor_supported(&self) -> bool {
+            true
+        }
+
+        /// Returns at once: the worker opens and closes the output.
+        fn set_monitor(&mut self, on: bool) {
+            self.monitor.request(on);
+        }
+
+        fn monitor_event(&mut self) -> Option<MonitorEvent> {
+            self.monitor.event()
         }
     }
 
@@ -904,6 +1332,97 @@ mod mac {
                 "demanded {demanded} frames in 3.5 s"
             );
         }
+
+        /// Polls `monitor_event` for up to 5 s, as the runner does each tick.
+        fn next_event(adapter: &mut CoreAudioAdapter) -> MonitorEvent {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(e) = adapter.monitor_event() {
+                    return e;
+                }
+                assert!(Instant::now() < deadline, "no monitor event");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// Needs the driver and a default output that is not VectorBridge.
+        /// Plays silence: `cargo test -p vectorcable coreaudio -- --ignored`.
+        #[test]
+        #[ignore]
+        fn monitor_plays_on_the_default_output_without_changing_rx_pacing() {
+            let mut adapter = CoreAudioAdapter::new().expect("adapter opens");
+            assert!(adapter.monitor_supported());
+            let start = Instant::now();
+            let (mut demanded, mut ticks) = (0usize, 0u32);
+            let mut slowest = Duration::ZERO;
+            let mut on_after = None;
+            adapter.set_monitor(true);
+            while start.elapsed() < Duration::from_secs(3) {
+                // The RX loop's calls, the monitor ones included, while the
+                // output opens: none may wait on it.
+                let asked = Instant::now();
+                let want = adapter.rx_demand(LocalTime(start.elapsed().as_secs_f64()));
+                adapter.write_rx(&vec![0; want]);
+                if let Some(e) = adapter.monitor_event() {
+                    assert!(matches!(e, MonitorEvent::On(_)), "{e:?}");
+                    on_after = Some(start.elapsed());
+                }
+                assert_eq!(adapter.fault(), None);
+                slowest = slowest.max(asked.elapsed());
+                if start.elapsed() > Duration::from_millis(500) {
+                    demanded += want;
+                }
+                ticks += 1;
+                std::thread::sleep(
+                    (start + Duration::from_millis(10) * ticks)
+                        .saturating_duration_since(Instant::now()),
+                );
+            }
+            let on_after = on_after.expect("monitor turned on");
+            eprintln!("monitor on after {on_after:?}; slowest RX tick {slowest:?}");
+            assert!(
+                slowest < Duration::from_millis(5),
+                "an RX tick took {slowest:?}"
+            );
+            // The RX device still sets the pace, as without the monitor.
+            let nominal = 2.5 * SAMPLE_RATE as f64;
+            assert!(
+                (demanded as f64 - nominal).abs() < 0.02 * nominal,
+                "demanded {demanded} frames in 2.5 s"
+            );
+            // The output pulled what it plays: at least a second's worth.
+            let pulled = lock(&adapter.tap).as_ref().expect("tap open").pulled;
+            assert!(pulled > 24_000, "the output pulled {pulled} frames");
+            // A repeat on re-picks the output; off closes it.
+            adapter.set_monitor(true);
+            assert!(matches!(next_event(&mut adapter), MonitorEvent::On(_)));
+            assert!(lock(&adapter.tap).is_some());
+            adapter.set_monitor(false);
+            assert_eq!(next_event(&mut adapter), MonitorEvent::Off);
+            assert!(lock(&adapter.tap).is_none());
+        }
+
+        /// The monitor's IOProc leaves an output's microphone off (a headset or
+        /// AirPods is one device with both). VectorBridge RX has input streams
+        /// to try it on; it plays silence there.
+        #[test]
+        #[ignore]
+        fn monitor_ioproc_leaves_input_streams_off() {
+            let dev = device_for_uid(RX_APP_UID).expect("driver installed");
+            assert!(channels(dev, SCOPE_INPUT) > 0);
+            let running =
+                Running::start(dev, Side::Monitor(Arc::new(Mutex::new(None))), "test").unwrap();
+            let flags = input_stream_usage(dev, running.id, false).expect("input streams");
+            assert!(
+                !flags.is_empty() && flags.iter().all(|&f| f == 0),
+                "{flags:?}"
+            );
+            // Control: any other IOProc has them on, as Core Audio starts it.
+            let rx = Arc::new(Mutex::new(RxFifo::with_capacity()));
+            let other = Running::start(dev, Side::Output(rx), "control").unwrap();
+            let flags = input_stream_usage(dev, other.id, false).expect("input streams");
+            assert!(flags.iter().all(|&f| f != 0), "control: {flags:?}");
+        }
     }
 }
 
@@ -955,6 +1474,169 @@ mod tests {
         assert_eq!(rx_demand_for(f.len(), target), 512);
         assert_eq!(rx_demand_for(target + 100, target), 0);
         assert_eq!(rx_demand_for(0, 100_000), MAX_CATCH_UP_FRAMES);
+    }
+
+    fn tone_48k(n: usize, start: usize, hz: f64) -> Vec<i16> {
+        (start..start + n)
+            .map(|k| {
+                let t = k as f64 / SAMPLE_RATE as f64;
+                (0.5 * 32767.0 * (2.0 * std::f64::consts::PI * hz * t).sin()) as i16
+            })
+            .collect()
+    }
+
+    /// Runs the monitor for `secs`: the RX side pushes 10 ms blocks at 48 kHz,
+    /// the output pulls stereo 512-frame buffers at `rate` * (1 + `ppm`).
+    /// Returns the left channel heard, the frames that had audio, and the
+    /// most the queue ever held.
+    fn run_monitor(rate: f64, ppm: f64, secs: usize) -> (Vec<f32>, usize, usize) {
+        let mut m = MonitorFifo::new(rate);
+        let pulled_per_s = rate * (1.0 + ppm * 1e-6);
+        let (mut sent, mut owed, mut had, mut most) = (0usize, 0.0f64, 0usize, 0usize);
+        let mut heard = Vec::new();
+        let mut buf = vec![0.0f32; 2 * 512];
+        for _ in 0..secs * 100 {
+            m.push(&tone_48k(SAMPLES_PER_PACKET, sent, 1000.0));
+            sent += SAMPLES_PER_PACKET;
+            most = most.max(m.q.len());
+            owed += pulled_per_s / 100.0;
+            while owed >= 512.0 {
+                owed -= 512.0;
+                had += m.fill(&mut buf, 2);
+                for f in buf.chunks(2) {
+                    assert_eq!(f[0], f[1]);
+                    heard.push(f[0]);
+                }
+            }
+        }
+        (heard, had, most)
+    }
+
+    #[test]
+    fn monitor_keeps_tone_frequency_and_level_at_44k1() {
+        let (heard, _, _) = run_monitor(44_100.0, 0.0, 3);
+        let tail = &heard[44_100..];
+        let ups = tail
+            .windows(2)
+            .filter(|w| w[0] < 0.0 && w[1] >= 0.0)
+            .count();
+        let hz = ups as f64 * 44_100.0 / tail.len() as f64;
+        assert!((hz - 1000.0).abs() < 2.0, "{hz} Hz");
+        let rms =
+            (tail.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() / tail.len() as f64).sqrt();
+        let expected = 0.5 / 2f64.sqrt();
+        assert!((rms - expected).abs() < 0.02 * expected, "rms {rms}");
+    }
+
+    #[test]
+    fn monitor_at_48k_passes_samples_through_unchanged() {
+        let mut m = MonitorFifo::new(48_000.0);
+        let input = tone_48k(MONITOR_TARGET, 0, 1000.0);
+        m.push(&input);
+        let mut out = vec![0.0f32; 2 * 100];
+        assert_eq!(m.fill(&mut out, 2), 100);
+        for (k, f) in out.chunks(2).enumerate() {
+            assert_eq!(f[0], to_f32(input[k]));
+        }
+    }
+
+    #[test]
+    fn monitor_waits_for_its_target_then_runs_dry_into_silence() {
+        let mut m = MonitorFifo::new(48_000.0);
+        m.push(&vec![16384; MONITOR_TARGET - 1]);
+        let mut out = vec![9.0f32; 4];
+        assert_eq!(m.fill(&mut out, 1), 0, "not primed yet");
+        assert_eq!(out, [0.0; 4]);
+        m.push(&[16384]);
+        let mut out = vec![9.0f32; MONITOR_TARGET + 10];
+        let had = m.fill(&mut out, 1);
+        assert!(had < MONITOR_TARGET && had + 2 >= MONITOR_TARGET, "{had}");
+        assert!(out[..had].iter().all(|&x| x == 0.5));
+        assert!(out[had..].iter().all(|&x| x == 0.0));
+    }
+
+    /// The output's clock is not the RX device's: either way the queue stays
+    /// bounded and nearly all of the time is heard.
+    #[test]
+    fn monitor_queue_stays_bounded_with_output_drift() {
+        for ppm in [-500.0, 500.0] {
+            let (heard, had, most) = run_monitor(44_100.0, ppm, 300);
+            assert!(most <= MONITOR_HIGH, "{ppm} ppm: queue reached {most}");
+            let gap = 1.0 - had as f64 / heard.len() as f64;
+            assert!(gap < 0.002, "{ppm} ppm: {gap} of the time silent");
+        }
+    }
+
+    #[test]
+    fn monitor_fills_every_buffer_of_a_non_interleaved_device() {
+        let left = [0.25f32, 0.5, -1.0];
+        let mut right = [9.0f32; 3];
+        copy_first_channel(&left, 1, &mut right, 1);
+        assert_eq!(right, left);
+        let stereo = [0.1f32, 0.1, 0.2, 0.2];
+        let mut quad = [9.0f32; 8];
+        copy_first_channel(&stereo, 2, &mut quad, 4);
+        assert_eq!(quad, [0.1, 0.1, 0.1, 0.1, 0.2, 0.2, 0.2, 0.2]);
+    }
+
+    fn dev(name: &str, uid: &str) -> DeviceId {
+        DeviceId {
+            name: name.into(),
+            uid: uid.into(),
+        }
+    }
+
+    #[test]
+    fn monitor_refuses_a_vectorbridge_output_by_name_or_uid() {
+        let speakers = dev("MacBook Pro Speakers", "BuiltInSpeakerDevice");
+        assert_eq!(monitor_refused(&speakers, &[]), None);
+        let why = monitor_refused(&dev("VectorBridge TX", "VectorBridgeTX_UID"), &[]).unwrap();
+        assert!(
+            why.starts_with("VectorBridge TX is a VectorBridge device"),
+            "{why}"
+        );
+        assert!(monitor_refused(&dev("Cable Out", "VectorBridgeRX_UID"), &[]).is_some());
+        assert!(monitor_refused(&dev("vectorbridge rx", "x"), &[]).is_some());
+        // Unnamed, it cannot be told apart from a VectorBridge device.
+        assert!(monitor_refused(&dev("", ""), &[]).is_some());
+        assert_eq!(monitor_refused(&dev("", "BuiltInSpeakerDevice"), &[]), None);
+    }
+
+    /// A Multi-Output or Aggregate device is refused when anything inside it
+    /// is VectorBridge, or cannot be named; plain parts are fine.
+    #[test]
+    fn monitor_refuses_a_combined_output_that_includes_vectorbridge() {
+        let multi = dev("Multi-Output Device", "~:AMS2_StackedOutput:0");
+        let speakers = dev("MacBook Pro Speakers", "BuiltInSpeakerDevice");
+        let tx = dev("", "VectorBridgeTX_UID");
+        assert_eq!(
+            monitor_refused(&multi, std::slice::from_ref(&speakers)),
+            None
+        );
+        let why = monitor_refused(&multi, &[speakers.clone(), tx]).unwrap();
+        assert_eq!(
+            why,
+            "Multi-Output Device includes a VectorBridge device; choose speakers or headphones as the sound output"
+        );
+        let why = monitor_refused(&multi, &[speakers, dev("", "")]).unwrap();
+        assert!(why.contains("no name or UID"), "{why}");
+    }
+
+    /// A buffer that ends with the queue down to its last sample stops
+    /// playing there, and the next waits for the target instead of guessing.
+    #[test]
+    fn monitor_that_runs_dry_at_a_buffer_end_waits_for_the_target() {
+        // Two input frames per output frame: 3840 queued last 1920 frames.
+        let mut m = MonitorFifo::new(24_000.0);
+        m.push(&vec![16384; MONITOR_TARGET]);
+        let mut out = vec![9.0f32; MONITOR_TARGET / 2];
+        assert_eq!(m.fill(&mut out, 1), MONITOR_TARGET / 2);
+        assert!(!m.playing, "dry at the buffer's end");
+        m.push(&[16384; 10]);
+        let mut out = vec![9.0f32; 4];
+        assert_eq!(m.fill(&mut out, 1), 0, "waits for the target");
+        assert_eq!(out, [0.0; 4]);
+        assert_eq!(m.pulled, (MONITOR_TARGET / 2 + 4) as u64);
     }
 
     #[test]

@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.0 (2026-11-11, beta)
+
+- Install, upgrade and remove: the README and the macOS and Linux guides give each GitHub
+  command as one line to copy, and say how to upgrade (run the install line again; settings and
+  the bridge log-in are kept).
+
+- Radio monitor: press `m` to hear the radio on the computer's sound output (speakers or
+  headphones) while the apps decode, and `m` again to stop. Off at each start. It plays on the
+  output chosen when `m` is pressed and refuses a VectorBridge device. macOS and Linux.
+- Rig control: when an app keys the radio while VectorCable is Listen Only, VectorCable says so
+  (the radio transmits but no audio is sent). The key still goes to the radio, as before.
+- Linux: the bridge PIN is typed once per bridge. VectorCable keeps the bridge's app token (never
+  the PIN) in `~/.local/state/vectorcable/tokens`, readable only by you, as the macOS version does
+  in the Keychain. If that file cannot be written, the PIN is asked for on each start, as before.
+- Bridge PIN: the Status tab shows whether the bridge PIN is entered, and until it is, the Check
+  tab says where it is set and reset. When something needs the PIN (a level change, or an app's
+  rig control, CAT or PTT), VectorCable asks for it with `p` and says where it is set and reset.
+  On a CAT radio whose bridge requires a login for rig control, Transmit shows Not Ready until the
+  PIN is entered, since apps cannot key the radio before.
+
 ## 0.2.1 (2026-11-04, beta)
 
 - Rig control relay: a single failed check of the bridge's rig control settings (a short Wi-Fi

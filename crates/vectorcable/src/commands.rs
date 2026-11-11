@@ -109,6 +109,7 @@ fn snapshot_of(
         listing: None,
         audio_name: audio_adapter_name(),
         audio_fault: None,
+        monitor: None,
         slot_held_by_other,
         rig_relay: None,
         local_ip: None,

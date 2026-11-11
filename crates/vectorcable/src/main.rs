@@ -13,6 +13,8 @@ mod keychain;
 #[cfg(any(target_os = "linux", test))]
 mod pipewire;
 mod theme;
+#[cfg(target_os = "linux")]
+mod tokenfile;
 mod ui;
 
 use std::io::IsTerminal;

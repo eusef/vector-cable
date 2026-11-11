@@ -287,8 +287,13 @@ pub fn post_listing(
             let warning = match (issuer.as_deref(), web.tokens) {
                 (Some(d), Some(store)) if issuer == device && held.is_some() => {
                     store.save(d, &fresh).err().map(|e| {
+                        let store = if cfg!(target_os = "macos") {
+                            "The Keychain"
+                        } else {
+                            "The token file"
+                        };
                         format!(
-                            "The Keychain did not keep the bridge token ({e}), so the next \
+                            "{store} did not keep the bridge token ({e}), so the next \
                              run asks for the PIN again."
                         )
                     })
